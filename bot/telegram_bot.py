@@ -1,8 +1,10 @@
 import logging
 import datetime
+import html
 import secrets
 import string
 import random
+import time
 from typing import Dict, Any, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -17,19 +19,38 @@ from telegram.ext import (
 logger = logging.getLogger("lemon-emby.bot")
 
 class LemonEmbyBot:
-    """Telegram Bot with Rich Inline Keyboards, Economy, and Interactive Mini-Games"""
+    """Telegram Bot with Rich Inline Keyboards, Security Hardening, Economy & Mini-Games"""
     def __init__(self, token: str, config: dict, db, emby_client):
         self.token = token
         self.config = config
         self.db = db
         self.emby = emby_client
-        self.admin_ids = config.get("telegram", {}).get("admin_ids", [])
+        raw_admin_ids = config.get("telegram", {}).get("admin_ids", [])
+        self.admin_ids = [int(i) for i in raw_admin_ids if str(i).isdigit() or (str(i).startswith("-") and str(i)[1:].isdigit())]
         self.app = Application.builder().token(token).build()
-        self.pending_duels = {}  # {challenge_id: {u1_tg, u2_tg, bet, time}}
+        self.pending_duels: Dict[str, dict] = {}
+        self.user_cooldowns: Dict[int, float] = {}  # {tg_id: last_command_time}
+        self.rob_counts: Dict[str, int] = {}       # {"YYYY-MM-DD:tg_id": count}
         self._register_handlers()
 
     def _is_admin(self, user_id: int) -> bool:
         return user_id in self.admin_ids
+
+    def _check_cooldown(self, user_id: int, cooldown_seconds: float = 2.0) -> bool:
+        """Returns True if user is within cooldown (throttled)"""
+        now = time.time()
+        last = self.user_cooldowns.get(user_id, 0)
+        if now - last < cooldown_seconds:
+            return True
+        self.user_cooldowns[user_id] = now
+        return False
+
+    def _clean_expired_duels(self):
+        """Clean up pending duels older than 120 seconds"""
+        now = datetime.datetime.now()
+        expired_keys = [k for k, v in self.pending_duels.items() if (now - v["time"]).total_seconds() > 120]
+        for k in expired_keys:
+            self.pending_duels.pop(k, None)
 
     def _register_handlers(self):
         # General & Account
@@ -71,7 +92,7 @@ class LemonEmbyBot:
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
 
     async def send_notification(self, tg_id: int, message: str):
-        """Send message directly to user"""
+        """Send message directly to user with error handling"""
         try:
             await self.app.bot.send_message(chat_id=tg_id, text=message, parse_mode="HTML")
         except Exception as e:
@@ -121,11 +142,13 @@ class LemonEmbyBot:
 
     async def cmd_start(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user = update.effective_user
+        if not user or not update.message: return
         is_admin = self._is_admin(user.id)
+        name = html.escape(user.first_name or "朋友")
         
         text = (
             f"🍋 <b>欢迎来到 Lemon Emby 智能中控！</b>\n\n"
-            f"你好，<b>{user.first_name}</b>！这里是 Emby 媒体服务器专属服务助手。\n\n"
+            f"你好，<b>{name}</b>！这里是 Emby 媒体服务器专属服务助手。\n\n"
             f"📌 <b>常用操作：</b>\n"
             f"• 点击 <b>【👤 个人中心】</b> 查看账号与剩余天数\n"
             f"• 每日 <b>【🎁 每日签到】</b> 免费领取时长与积分\n"
@@ -136,6 +159,7 @@ class LemonEmbyBot:
         await update.message.reply_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
 
     async def cmd_help(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         is_admin = self._is_admin(update.effective_user.id)
         user_help = (
             "📖 <b>Lemon Emby 用户指令大全：</b>\n\n"
@@ -169,6 +193,7 @@ class LemonEmbyBot:
         await update.message.reply_text(user_help + admin_help, parse_mode="HTML")
 
     async def cmd_my(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
         u = await self.db.get_user_by_tg(user_id)
         
@@ -184,16 +209,17 @@ class LemonEmbyBot:
         now = datetime.datetime.now(datetime.timezone.utc)
         delta_days = (expiry - now).days
         status_tag = "🔴 已过期/冻结" if (delta_days < 0 or u.get("is_disabled")) else f"🟢 正常 (剩余 {delta_days} 天)"
+        username_safe = html.escape(u.get("emby_username", ""))
 
         text = (
             f"👤 <b>我的 Emby 账号档案</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"🏷️ <b>用户名：</b> <code>{u['emby_username']}</code>\n"
+            f"🏷️ <b>用户名：</b> <code>{username_safe}</code>\n"
             f"📶 <b>账号状态：</b> {status_tag}\n"
             f"⏳ <b>到期时间：</b> <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code>\n"
             f"💎 <b>账户积分：</b> <code>{u.get('points', 0)}</code> PTS\n"
             f"📱 <b>最大设备限制：</b> <code>{u.get('max_devices', 2)}</code> 台\n"
-            f"🌐 <b>服务器地址：</b> <code>{self.config.get('emby', {}).get('public_url')}</code>\n"
+            f"🌐 <b>服务器地址：</b> <code>{html.escape(self.config.get('emby', {}).get('public_url', ''))}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💡 <i>提示：发送 <code>/resetpw 新密码</code> 可自助修改密码。</i>"
         )
@@ -201,23 +227,31 @@ class LemonEmbyBot:
 
     # --- GAMING MODES: DICE, ROB, PK DUEL ---
     async def cmd_dice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         sender_id = update.effective_user.id
+        if self._check_cooldown(sender_id, cooldown_seconds=1.5):
+            return
+
         args = context.args
         reply_msg = update.message.reply_to_message
 
         bet = 10
-        if args and args[0].isdigit():
-            bet = int(args[0])
+        if args:
+            try:
+                bet = max(1, min(1000, int(args[0])))
+            except ValueError:
+                bet = 10
 
         if reply_msg and reply_msg.from_user and reply_msg.from_user.id != sender_id:
-            # PvP Duel challenge
             target_user = reply_msg.from_user
             duel_id = secrets.token_hex(4)
+            self._clean_expired_duels()
+
             self.pending_duels[duel_id] = {
                 "u1_tg": sender_id,
                 "u2_tg": target_user.id,
-                "u1_name": update.effective_user.first_name,
-                "u2_name": target_user.first_name,
+                "u1_name": update.effective_user.first_name or "群友",
+                "u2_name": target_user.first_name or "群友",
                 "bet": bet,
                 "time": datetime.datetime.now()
             }
@@ -230,15 +264,14 @@ class LemonEmbyBot:
             ])
             text = (
                 f"⚔️ <b>掷骰 PK 决斗挑战发起！</b>\n\n"
-                f"👤 <b>发起者：</b> {update.effective_user.first_name}\n"
-                f"🎯 <b>应战方：</b> {target_user.first_name}\n"
+                f"👤 <b>发起者：</b> {html.escape(update.effective_user.first_name or '群友')}\n"
+                f"🎯 <b>应战方：</b> {html.escape(target_user.first_name or '群友')}\n"
                 f"💰 <b>押注积分：</b> <b>{bet}</b> PTS\n\n"
                 f"<i>请应战方点击下方按钮应战（60秒内有效）！</i>"
             )
             await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
             return
 
-        # PvE Solo roll against Lemon Bot
         res = await self.db.game_dice_bot(sender_id, bet)
         if not res.get("success"):
             await update.message.reply_text(f"⚠️ {res.get('msg')}")
@@ -263,9 +296,17 @@ class LemonEmbyBot:
         await self.cmd_dice(update, context)
 
     async def cmd_rob(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         from_id = update.effective_user.id
         reply_msg = update.message.reply_to_message
         args = context.args
+
+        # Anti-flood check
+        today_key = f"{datetime.date.today().isoformat()}:{from_id}"
+        robbed_today = self.rob_counts.get(today_key, 0)
+        if robbed_today >= 5:
+            await update.message.reply_text("🛑 今日打劫次数已达上限（每日限 5 次），做个遵纪守法的好群友吧！")
+            return
 
         to_id = None
         if reply_msg and reply_msg.from_user:
@@ -288,26 +329,31 @@ class LemonEmbyBot:
             await update.message.reply_text(f"⚠️ {res.get('msg')}", parse_mode="HTML")
             return
 
+        self.rob_counts[today_key] = robbed_today + 1
+        robber_name = html.escape(update.effective_user.first_name or "神秘人")
+        victim_name = html.escape(res.get("victim_name", "受害者"))
+
         if res["status"] == "win":
             text = (
                 f"🥷 <b>打劫大成功！劫富济贫！</b>\n\n"
-                f"👤 劫匪：<b>{update.effective_user.first_name}</b>\n"
-                f"🎯 受害者：<code>{res['victim_name']}</code>\n"
+                f"👤 劫匪：<b>{robber_name}</b>\n"
+                f"🎯 受害者：<code>{victim_name}</code>\n"
                 f"💰 成功掠夺：<b>+{res['robbed_amount']}</b> 积分！\n\n"
-                f"<i>受害者已被洗劫，劫匪潇洒离去~</i>"
+                f"<i>受害者已被洗劫，劫匪潇洒离去~ (今日剩余次数: {4 - robbed_today})</i>"
             )
         else:
             text = (
                 f"💥 <b>打劫翻车！被当场反杀！</b>\n\n"
-                f"👤 劫匪：<b>{update.effective_user.first_name}</b>\n"
-                f"🛡️ 勇士：<code>{res['victim_name']}</code>\n"
+                f"👤 劫匪：<b>{robber_name}</b>\n"
+                f"🛡️ 勇士：<code>{victim_name}</code>\n"
                 f"💸 赔偿罚金：<b>-{res['penalty']}</b> 积分（已直接转入受害者账户）\n\n"
-                f"<i>偷鸡不成蚀把米，受害者笑嘻嘻收下赔款！</i>"
+                f"<i>偷鸡不成蚀把米，受害者笑嘻嘻收下赔款！(今日剩余次数: {4 - robbed_today})</i>"
             )
         await update.message.reply_text(text, parse_mode="HTML")
 
     # --- POINTS & ECONOMY HANDLERS ---
     async def cmd_shop(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
         u = await self.db.get_user_by_tg(user_id)
         pts = u.get("points", 0) if u else 0
@@ -327,7 +373,10 @@ class LemonEmbyBot:
         await update.message.reply_text(text, reply_markup=self._get_shop_keyboard(), parse_mode="HTML")
 
     async def cmd_lottery(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
+        if self._check_cooldown(user_id, cooldown_seconds=1.5): return
+
         res = await self.db.lottery_draw(user_id, cost=20)
         if not res.get("success"):
             await update.message.reply_text(f"⚠️ {res.get('msg')}")
@@ -345,6 +394,7 @@ class LemonEmbyBot:
         await update.message.reply_text(text, parse_mode="HTML")
 
     async def cmd_transfer(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         from_id = update.effective_user.id
         args = context.args
         reply_msg = update.message.reply_to_message
@@ -352,20 +402,20 @@ class LemonEmbyBot:
         to_id = None
         amount = 0
 
-        if reply_msg and reply_msg.from_user:
-            to_id = reply_msg.from_user.id
-            if args and args[0].isdigit():
-                amount = int(args[0])
-        elif args and len(args) >= 2:
-            target_str = args[0].strip()
-            if target_str.isdigit():
-                to_id = int(target_str)
-            else:
-                target_u = await self.db.get_user_by_username(target_str.lstrip("@"))
-                if target_u:
-                    to_id = target_u["tg_id"]
-            if args[1].isdigit():
+        try:
+            if reply_msg and reply_msg.from_user:
+                to_id = reply_msg.from_user.id
+                if args: amount = int(args[0])
+            elif args and len(args) >= 2:
+                target_str = args[0].strip()
+                if target_str.isdigit():
+                    to_id = int(target_str)
+                else:
+                    target_u = await self.db.get_user_by_username(target_str.lstrip("@"))
+                    if target_u: to_id = target_u["tg_id"]
                 amount = int(args[1])
+        except (ValueError, IndexError):
+            amount = 0
 
         if not to_id or amount <= 0:
             await update.message.reply_text(
@@ -381,15 +431,17 @@ class LemonEmbyBot:
             await update.message.reply_text(f"❌ {res.get('msg')}")
             return
 
+        target_name_safe = html.escape(res.get("to_username", "群友"))
         text = (
             f"💸 <b>积分转账成功！</b>\n\n"
             f"📤 转出积分：<b>{res['amount']}</b> PTS\n"
-            f"📥 收款方：<code>{res['to_username']}</code> (TG: {to_id})\n"
+            f"📥 收款方：<code>{target_name_safe}</code> (TG: {to_id})\n"
             f"💎 您的剩余积分：<code>{res['from_remaining']}</code> PTS"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
     async def cmd_rank(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.message: return
         top_users = await self.db.get_leaderboard(limit=10)
         if not top_users:
             await update.message.reply_text("暂无排行榜数据")
@@ -399,7 +451,8 @@ class LemonEmbyBot:
         lines = []
         for i, u in enumerate(top_users):
             m = medals[i] if i < len(medals) else f"{i+1}."
-            lines.append(f"{m} <b>{u['emby_username']}</b> — <code>{u.get('points', 0)}</code> 积分 (设备: {u.get('max_devices', 2)}台)")
+            name_safe = html.escape(u.get("emby_username", "匿名"))
+            lines.append(f"{m} <b>{name_safe}</b> — <code>{u.get('points', 0)}</code> 积分 (设备: {u.get('max_devices', 2)}台)")
 
         text = (
             f"🏆 <b>Lemon Emby 积分富豪榜 TOP 10</b>\n"
@@ -412,7 +465,7 @@ class LemonEmbyBot:
 
     # --- ADMIN POINTS MANAGEMENT ---
     async def cmd_addpts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
         args = context.args
         reply_msg = update.message.reply_to_message
@@ -420,24 +473,26 @@ class LemonEmbyBot:
         target_u = None
         pts = 0
 
-        if reply_msg and reply_msg.from_user:
-            target_u = await self.db.get_user_by_tg(reply_msg.from_user.id)
-            if args and args[0].isdigit():
-                pts = int(args[0])
-        elif args and len(args) >= 2:
-            target_u = await self.db.get_user_by_identifier(args[0])
-            if args[1].isdigit():
+        try:
+            if reply_msg and reply_msg.from_user:
+                target_u = await self.db.get_user_by_tg(reply_msg.from_user.id)
+                if args: pts = int(args[0])
+            elif args and len(args) >= 2:
+                target_u = await self.db.get_user_by_identifier(args[0])
                 pts = int(args[1])
+        except (ValueError, IndexError):
+            pts = 0
 
         if not target_u or pts <= 0:
             await update.message.reply_text("💡 格式：回复用户 <code>/addpts 100</code> 或 <code>/addpts 用户名 100</code>", parse_mode="HTML")
             return
 
         new_total = await self.db.add_user_points(target_u["tg_id"], pts)
-        await update.message.reply_text(f"✅ 已为 <code>{target_u['emby_username']}</code> 增加 <b>{pts}</b> 积分！当前总积分：<code>{new_total}</code>", parse_mode="HTML")
+        name_safe = html.escape(target_u.get("emby_username", ""))
+        await update.message.reply_text(f"✅ 已为 <code>{name_safe}</code> 增加 <b>{pts}</b> 积分！当前总积分：<code>{new_total}</code>", parse_mode="HTML")
 
     async def cmd_delpts(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
         args = context.args
         reply_msg = update.message.reply_to_message
@@ -445,24 +500,27 @@ class LemonEmbyBot:
         target_u = None
         pts = 0
 
-        if reply_msg and reply_msg.from_user:
-            target_u = await self.db.get_user_by_tg(reply_msg.from_user.id)
-            if args and args[0].isdigit():
-                pts = int(args[0])
-        elif args and len(args) >= 2:
-            target_u = await self.db.get_user_by_identifier(args[0])
-            if args[1].isdigit():
+        try:
+            if reply_msg and reply_msg.from_user:
+                target_u = await self.db.get_user_by_tg(reply_msg.from_user.id)
+                if args: pts = int(args[0])
+            elif args and len(args) >= 2:
+                target_u = await self.db.get_user_by_identifier(args[0])
                 pts = int(args[1])
+        except (ValueError, IndexError):
+            pts = 0
 
         if not target_u or pts <= 0:
             await update.message.reply_text("💡 格式：回复用户 <code>/delpts 100</code> 或 <code>/delpts 用户名 100</code>", parse_mode="HTML")
             return
 
         new_total = await self.db.add_user_points(target_u["tg_id"], -pts)
-        await update.message.reply_text(f"🛑 已扣除 <code>{target_u['emby_username']}</code> <b>{pts}</b> 积分！当前剩余积分：<code>{new_total}</code>", parse_mode="HTML")
+        name_safe = html.escape(target_u.get("emby_username", ""))
+        await update.message.reply_text(f"🛑 已扣除 <code>{name_safe}</code> <b>{pts}</b> 积分！当前剩余积分：<code>{new_total}</code>", parse_mode="HTML")
 
     # --- LOOKUP / INFO ---
     async def cmd_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         sender_id = update.effective_user.id
         is_admin = self._is_admin(sender_id)
         args = context.args
@@ -473,7 +531,7 @@ class LemonEmbyBot:
 
         if reply_msg and reply_msg.from_user:
             target_user = reply_msg.from_user
-            target_name = target_user.first_name or target_user.username
+            target_name = target_user.first_name or target_user.username or "群友"
             u_db = await self.db.get_user_by_tg(target_user.id)
         elif args:
             identifier = args[0].strip()
@@ -486,7 +544,7 @@ class LemonEmbyBot:
             u_db = await self.db.get_user_by_tg(sender_id)
 
         if not u_db:
-            who = f"用户 <code>{target_name or (args[0] if args else '您')}</code>"
+            who = f"用户 <code>{html.escape(target_name or (args[0] if args else '您'))}</code>"
             await update.message.reply_text(f"❌ 未查询到 {who} 的 Emby 绑定信息！", parse_mode="HTML")
             return
 
@@ -505,15 +563,16 @@ class LemonEmbyBot:
         if user_sessions:
             items = []
             for s in user_sessions:
-                dev = s.get("DeviceName", "未知设备")
-                media = s.get("NowPlayingItem", {}).get("Name", "媒体")
+                dev = html.escape(s.get("DeviceName", "未知设备"))
+                media = html.escape(s.get("NowPlayingItem", {}).get("Name", "媒体"))
                 items.append(f"• <b>{dev}</b>: <i>{media}</i>")
             playing_info = f"🔥 <b>正在播放中 ({len(user_sessions)} 台设备)：</b>\n" + "\n".join(items)
 
+        emby_name_safe = html.escape(u_db.get("emby_username", ""))
         text = (
             f"🔍 <b>Emby 用户状态档案</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>Emby 账号：</b> <code>{u_db['emby_username']}</code>\n"
+            f"👤 <b>Emby 账号：</b> <code>{emby_name_safe}</code>\n"
             f"🆔 <b>Telegram ID：</b> <code>{u_db['tg_id']}</code>\n"
             f"📶 <b>账号状态：</b> {status_tag}\n"
             f"⏳ <b>到期时间：</b> <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code>\n"
@@ -526,7 +585,7 @@ class LemonEmbyBot:
 
     # --- ADMIN: ONE-CLICK CREATE USER ---
     async def cmd_create(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
 
         reply_msg = update.message.reply_to_message
@@ -543,13 +602,14 @@ class LemonEmbyBot:
 
             if args:
                 if args[0].isdigit():
-                    days = int(args[0])
+                    days = max(1, min(3650, int(args[0])))
                     if len(args) > 1: password = args[1]
                     if len(args) > 2: username = args[2]
                 else:
                     username = args[0]
                     if len(args) > 1: password = args[1]
-                    if len(args) > 2 and args[2].isdigit(): days = int(args[2])
+                    if len(args) > 2 and args[2].isdigit():
+                        days = max(1, min(3650, int(args[2])))
 
             if not password:
                 password = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
@@ -565,15 +625,20 @@ class LemonEmbyBot:
 
             username = args[0].strip()
             password = args[1].strip() if len(args) > 1 else "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
-            days = int(args[2]) if len(args) > 2 and args[2].isdigit() else 30
+            days = max(1, min(3650, int(args[2]))) if len(args) > 2 and args[2].isdigit() else 30
             target_tg_id = int(args[3]) if len(args) > 3 and args[3].isdigit() else 0
+
+        # Sanitize username (alphanumeric, underscore, dash)
+        username = "".join(c for c in username if c.isalnum() or c in "_-")
+        if not username:
+            username = f"user_{secrets.randbelow(100000)}"
 
         if target_tg_id:
             existing = await self.db.get_user_by_tg(target_tg_id)
             if existing:
                 await update.message.reply_text(
-                    f"⚠️ 该用户 (TG: <code>{target_tg_id}</code>) 已绑定 Emby 账号：<code>{existing['emby_username']}</code>！\n"
-                    f"如需延期请使用 <code>/addtime {existing['emby_username']} {days}</code>。",
+                    f"⚠️ 该用户 (TG: <code>{target_tg_id}</code>) 已绑定 Emby 账号：<code>{html.escape(existing['emby_username'])}</code>！\n"
+                    f"如需延期请使用 <code>/addtime {html.escape(existing['emby_username'])} {days}</code>。",
                     parse_mode="HTML"
                 )
                 return
@@ -594,12 +659,15 @@ class LemonEmbyBot:
         await self.db.create_user_record(tg_id_to_save, emby_user_id, username, days=days)
         await self.db.log_action(update.effective_user.id, "ADMIN_CREATE", f"Created {username} for TG:{target_tg_id} days:{days}")
 
-        public_url = self.config.get("emby", {}).get("public_url", "https://emby.example.com")
+        public_url = html.escape(self.config.get("emby", {}).get("public_url", "https://emby.example.com"))
+        name_safe = html.escape(username)
+        pass_safe = html.escape(password)
+        
         reply_card = (
             f"🎉 <b>Emby 账号一键开通成功！</b>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"👤 <b>用户名：</b> <code>{username}</code>\n"
-            f"🔑 <b>初始密码：</b> <code>{password}</code>\n"
+            f"👤 <b>用户名：</b> <code>{name_safe}</code>\n"
+            f"🔑 <b>初始密码：</b> <code>{pass_safe}</code>\n"
             f"⏳ <b>有效时长：</b> <b>{days}</b> 天\n"
             f"🆔 <b>绑定 TG：</b> <code>{target_tg_id or '未绑定'}</code>\n"
             f"🌐 <b>服务器地址：</b> <code>{public_url}</code>\n"
@@ -611,8 +679,8 @@ class LemonEmbyBot:
         if target_tg_id and target_tg_id > 0:
             dm_text = (
                 f"🎉 <b>你好！管理员已为你开通 Emby 观影账号！</b>\n\n"
-                f"👤 <b>登录账号：</b> <code>{username}</code>\n"
-                f"🔑 <b>登录密码：</b> <code>{password}</code>\n"
+                f"👤 <b>登录账号：</b> <code>{name_safe}</code>\n"
+                f"🔑 <b>登录密码：</b> <code>{pass_safe}</code>\n"
                 f"⏳ <b>有效期：</b> <b>{days}</b> 天\n"
                 f"🌐 <b>服务器地址：</b> <code>{public_url}</code>\n\n"
                 f"📱 <b>快速开始：</b>\n"
@@ -624,7 +692,7 @@ class LemonEmbyBot:
 
     # --- ADMIN: DELETE USER ---
     async def cmd_deluser(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
 
         reply_msg = update.message.reply_to_message
@@ -651,10 +719,13 @@ class LemonEmbyBot:
             await self.emby.delete_user(emby_uid)
         await self.db.delete_user_record(tg_id)
         await self.db.log_action(update.effective_user.id, "ADMIN_DELETE", f"Deleted {username} (TG: {tg_id})")
-        await update.message.reply_text(f"🗑️ 已成功删除用户 <code>{username}</code> (TG: <code>{tg_id}</code>) 的 Emby 账号及全部数据！", parse_mode="HTML")
+        await update.message.reply_text(f"🗑️ 已成功删除用户 <code>{html.escape(username)}</code> (TG: <code>{tg_id}</code>) 的 Emby 账号及全部数据！", parse_mode="HTML")
 
     async def cmd_checkin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
+        if self._check_cooldown(user_id, cooldown_seconds=1.0): return
+
         reward_days = self.config.get("telegram", {}).get("checkin_reward_days", 1)
         points = self.config.get("telegram", {}).get("checkin_points", 10)
         
@@ -673,18 +744,19 @@ class LemonEmbyBot:
         await update.message.reply_text(text, parse_mode="HTML")
 
     async def cmd_bind(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
         args = context.args
         if not args or len(args) < 2:
             await update.message.reply_text("💡 使用格式：<code>/bind &lt;用户名&gt; &lt;密码&gt;</code>", parse_mode="HTML")
             return
 
-        username = args[0].strip()
+        username = "".join(c for c in args[0].strip() if c.isalnum() or c in "_-")
         password = args[1].strip()
 
         existing = await self.db.get_user_by_tg(user_id)
         if existing:
-            await update.message.reply_text(f"⚠️ 你已经绑定了账号：<code>{existing['emby_username']}</code>，无法重复开号！", parse_mode="HTML")
+            await update.message.reply_text(f"⚠️ 你已经绑定了账号：<code>{html.escape(existing['emby_username'])}</code>，无法重复开号！", parse_mode="HTML")
             return
 
         emby_u = await self.emby.get_user_by_name(username)
@@ -704,15 +776,16 @@ class LemonEmbyBot:
 
         text = (
             f"🎉 <b>Emby 账号开通/绑定成功！</b>\n\n"
-            f"👤 用户名：<code>{username}</code>\n"
-            f"🔑 密码：<code>{password}</code>\n"
+            f"👤 用户名：<code>{html.escape(username)}</code>\n"
+            f"🔑 密码：<code>{html.escape(password)}</code>\n"
             f"🎁 初始赠送：<b>30</b> 天有效期\n"
-            f"🌐 服务器公网地址：<code>{self.config.get('emby', {}).get('public_url')}</code>\n\n"
+            f"🌐 服务器公网地址：<code>{html.escape(self.config.get('emby', {}).get('public_url', ''))}</code>\n\n"
             f"<i>请在客户端（Infuse/Fileball/Emby等）输入以上信息登录。</i>"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
     async def cmd_redeem(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
         args = context.args
         if not args:
@@ -735,6 +808,7 @@ class LemonEmbyBot:
         await update.message.reply_text(msg, parse_mode="HTML")
 
     async def cmd_resetpw(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
         args = context.args
         if not args:
@@ -749,22 +823,25 @@ class LemonEmbyBot:
         
         success = await self.emby.update_user_password(u["emby_user_id"], new_pw)
         if success:
-            await update.message.reply_text(f"✅ 密码修改成功！新密码已生效：<code>{new_pw}</code>", parse_mode="HTML")
+            await update.message.reply_text(f"✅ 密码修改成功！新密码已生效：<code>{html.escape(new_pw)}</code>", parse_mode="HTML")
         else:
             await update.message.reply_text("❌ 密码同步到 Emby 失败，请稍后重试。")
 
     # --- ADMIN MISC COMMANDS ---
     async def cmd_gen(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
         args = context.args
         if not args:
             await update.message.reply_text("💡 管理员格式：<code>/gen &lt;天数&gt; [张数]</code>", parse_mode="HTML")
             return
         
-        days = int(args[0])
-        count = int(args[1]) if len(args) > 1 else 1
-        count = min(count, 50)
+        try:
+            days = max(1, min(3650, int(args[0])))
+            count = max(1, min(50, int(args[1]) if len(args) > 1 else 1))
+        except ValueError:
+            await update.message.reply_text("❌ 参数必须为正整数！")
+            return
 
         codes = []
         for _ in range(count):
@@ -778,22 +855,22 @@ class LemonEmbyBot:
         )
 
     async def cmd_status(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
         
         sys_info = await self.emby.get_system_info()
         sessions = await self.emby.get_active_sessions()
         users = await self.db.get_all_users()
 
-        server_name = sys_info.get("ServerName", "Emby Server") if sys_info else "连接失败"
-        ver = sys_info.get("Version", "未知") if sys_info else "N/A"
+        server_name = html.escape(sys_info.get("ServerName", "Emby Server") if sys_info else "连接失败")
+        ver = html.escape(sys_info.get("Version", "未知") if sys_info else "N/A")
 
         active_str = ""
         if sessions:
             for s in sessions[:5]:
-                user_name = s.get("UserName", "Unknown")
-                dev = s.get("DeviceName", "Unknown")
-                item = s.get("NowPlayingItem", {}).get("Name", "媒体")
+                user_name = html.escape(s.get("UserName", "Unknown"))
+                dev = html.escape(s.get("DeviceName", "Unknown"))
+                item = html.escape(s.get("NowPlayingItem", {}).get("Name", "媒体"))
                 active_str += f"\n• <b>{user_name}</b> | {dev} 播放中: <i>{item}</i>"
         else:
             active_str = "\n• 暂无活跃播放会话"
@@ -810,20 +887,21 @@ class LemonEmbyBot:
         await update.message.reply_text(text, parse_mode="HTML")
 
     async def cmd_users(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
         users = await self.db.get_all_users()
         lines = []
         for u in users[:15]:
             status = "🔴" if u.get("is_disabled") else "🟢"
             exp = u.get("expiry_date", "")[:10]
-            lines.append(f"{status} <code>{u['emby_username']}</code> (TG: {u['tg_id']}) - 到期: {exp} - {u.get('points', 0)}分")
+            name_safe = html.escape(u.get("emby_username", ""))
+            lines.append(f"{status} <code>{name_safe}</code> (TG: {u['tg_id']}) - 到期: {exp} - {u.get('points', 0)}分")
         
         text = f"👥 <b>用户列表（前 15 名）：</b>\n\n" + ("\n".join(lines) if lines else "暂无用户")
         await update.message.reply_text(text, parse_mode="HTML")
 
     async def cmd_ban(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
         args = context.args
         if not args:
@@ -836,12 +914,12 @@ class LemonEmbyBot:
             u_db = await self.db.get_user_by_emby_id(emby_u["Id"])
             if u_db:
                 await self.db.update_user_status(u_db["tg_id"], True)
-            await update.message.reply_text(f"🛑 用户 <code>{username}</code> 已封禁/禁用！", parse_mode="HTML")
+            await update.message.reply_text(f"🛑 用户 <code>{html.escape(username)}</code> 已封禁/禁用！", parse_mode="HTML")
         else:
-            await update.message.reply_text(f"❌ 未找到用户 {username}")
+            await update.message.reply_text(f"❌ 未找到用户 {html.escape(username)}")
 
     async def cmd_unban(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
         args = context.args
         if not args:
@@ -854,23 +932,27 @@ class LemonEmbyBot:
             u_db = await self.db.get_user_by_emby_id(emby_u["Id"])
             if u_db:
                 await self.db.update_user_status(u_db["tg_id"], False)
-            await update.message.reply_text(f"✅ 用户 <code>{username}</code> 已解封！", parse_mode="HTML")
+            await update.message.reply_text(f"✅ 用户 <code>{html.escape(username)}</code> 已解封！", parse_mode="HTML")
         else:
-            await update.message.reply_text(f"❌ 未找到用户 {username}")
+            await update.message.reply_text(f"❌ 未找到用户 {html.escape(username)}")
 
     async def cmd_addtime(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        if not self._is_admin(update.effective_user.id):
+        if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
         args = context.args
         if len(args) < 2:
             await update.message.reply_text("💡 格式：<code>/addtime &lt;用户名&gt; &lt;天数&gt;</code>", parse_mode="HTML")
             return
         username = args[0]
-        days = int(args[1])
+        try:
+            days = max(1, min(3650, int(args[1])))
+        except ValueError:
+            await update.message.reply_text("❌ 天数必须为有效正整数")
+            return
         
         emby_u = await self.emby.get_user_by_name(username)
         if not emby_u:
-            await update.message.reply_text(f"❌ 未找到用户 {username}")
+            await update.message.reply_text(f"❌ 未找到用户 {html.escape(username)}")
             return
         
         u_db = await self.db.get_user_by_emby_id(emby_u["Id"])
@@ -880,13 +962,15 @@ class LemonEmbyBot:
         
         new_exp = await self.db.extend_user_expiry(u_db["tg_id"], days)
         await self.emby.set_user_disabled(emby_u["Id"], False)
-        await update.message.reply_text(f"✅ 已为 <code>{username}</code> 增加 {days} 天时长！\n新到期时间：<code>{new_exp.strftime('%Y-%m-%d %H:%M')}</code>", parse_mode="HTML")
+        name_safe = html.escape(username)
+        await update.message.reply_text(f"✅ 已为 <code>{name_safe}</code> 增加 {days} 天时长！\n新到期时间：<code>{new_exp.strftime('%Y-%m-%d %H:%M')}</code>", parse_mode="HTML")
 
     # --- CALLBACK HANDLER ---
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
+        if not query: return
         await query.answer()
-        data = query.data
+        data = query.data or ""
         user_id = query.from_user.id
         is_admin = self._is_admin(user_id)
 
@@ -930,13 +1014,13 @@ class LemonEmbyBot:
             if res["outcome"] == "tie":
                 res_text = "🤝 <b>势均力敌！双方平局！</b> 积分已全额保留。"
             else:
-                res_text = f"👑 <b>恭喜胜者：<code>{res['winner_name']}</code>！</b>\n💰 赢取赌注：<b>+{res['bet']}</b> 积分！"
+                res_text = f"👑 <b>恭喜胜者：<code>{html.escape(res.get('winner_name', ''))}</code>！</b>\n💰 赢取赌注：<b>+{res['bet']}</b> 积分！"
 
             text = (
                 f"⚔️ <b>掷骰 PK 决斗结果揭晓！</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"👤 <b>{res['u1_name']}：</b> {d1} <b>({res['u1_roll']} 点)</b>\n"
-                f"👤 <b>{res['u2_name']}：</b> {d2} <b>({res['u2_roll']} 点)</b>\n"
+                f"👤 <b>{html.escape(res['u1_name'])}：</b> {d1} <b>({res['u1_roll']} 点)</b>\n"
+                f"👤 <b>{html.escape(res['u2_name'])}：</b> {d2} <b>({res['u2_roll']} 点)</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
                 f"{res_text}"
             )
@@ -959,15 +1043,17 @@ class LemonEmbyBot:
             now = datetime.datetime.now(datetime.timezone.utc)
             delta_days = (expiry - now).days
             status_tag = "🔴 已过期" if delta_days < 0 else f"🟢 正常 (余 {delta_days} 天)"
+            name_safe = html.escape(u.get("emby_username", ""))
+            pub_url = html.escape(self.config.get("emby", {}).get("public_url", ""))
             text = (
                 f"👤 <b>我的 Emby 账号档案</b>\n"
                 f"━━━━━━━━━━━━━━━━━━━━\n"
-                f"🏷️ <b>用户名：</b> <code>{u['emby_username']}</code>\n"
+                f"🏷️ <b>用户名：</b> <code>{name_safe}</code>\n"
                 f"📶 <b>状态：</b> {status_tag}\n"
                 f"⏳ <b>到期时间：</b> <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code>\n"
                 f"💎 <b>积分：</b> <code>{u.get('points', 0)}</code> PTS\n"
                 f"📱 <b>最大设备限制：</b> <code>{u.get('max_devices', 2)}</code> 台\n"
-                f"🌐 <b>服务器地址：</b> <code>{self.config.get('emby', {}).get('public_url')}</code>"
+                f"🌐 <b>服务器地址：</b> <code>{pub_url}</code>"
             )
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
 
@@ -1002,7 +1088,7 @@ class LemonEmbyBot:
             if res.get("success"):
                 text = (
                     f"🎉 <b>兑换成功！</b>\n\n"
-                    f"📦 商品：<b>{res['item_name']}</b>\n"
+                    f"📦 商品：<b>{html.escape(res['item_name'])}</b>\n"
                     f"💸 消耗积分：<b>{res['cost']}</b> PTS\n"
                     f"💎 剩余积分：<code>{res['remaining_points']}</code> PTS\n"
                     f"✨ {res['details']}"
@@ -1036,7 +1122,7 @@ class LemonEmbyBot:
             lines = []
             for i, u in enumerate(top_users):
                 m = medals[i] if i < len(medals) else f"{i+1}."
-                lines.append(f"{m} <b>{u['emby_username']}</b> — <code>{u.get('points', 0)}</code> 积分")
+                lines.append(f"{m} <b>{html.escape(u.get('emby_username', ''))}</b> — <code>{u.get('points', 0)}</code> 积分")
 
             text = (
                 f"🏆 <b>Lemon Emby 积分富豪榜 TOP 10</b>\n"
@@ -1051,7 +1137,7 @@ class LemonEmbyBot:
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
 
         elif data == "cb_lines":
-            pub_url = self.config.get("emby", {}).get("public_url", "https://emby.example.com")
+            pub_url = html.escape(self.config.get("emby", {}).get("public_url", "https://emby.example.com"))
             text = f"🌐 <b>推荐线路</b>\n\n<code>{pub_url}</code>"
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
 

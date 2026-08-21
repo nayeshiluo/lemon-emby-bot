@@ -1,16 +1,52 @@
-from fastapi import FastAPI, HTTPException, Header, Depends
+from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 import os
-from typing import Optional, List
+import secrets
+import time
+import logging
+from typing import Optional, Dict
+
+logger = logging.getLogger("lemon-emby.web")
+
+# In-memory failed auth tracking: {ip: [fail_timestamps]}
+FAILED_ATTEMPTS: Dict[str, list] = {}
+MAX_FAILS = 5
+LOCKOUT_SECONDS = 300
+
+def check_ip_rate_limit(client_ip: str):
+    now = time.time()
+    fails = FAILED_ATTEMPTS.get(client_ip, [])
+    # Filter only recent fails within window
+    recent_fails = [t for t in fails if now - t < LOCKOUT_SECONDS]
+    FAILED_ATTEMPTS[client_ip] = recent_fails
+    if len(recent_fails) >= MAX_FAILS:
+        raise HTTPException(
+            status_code=429,
+            detail="Too many failed authentication attempts. Locked out for 5 minutes."
+        )
+
+def record_failed_attempt(client_ip: str):
+    now = time.time()
+    fails = FAILED_ATTEMPTS.get(client_ip, [])
+    fails.append(now)
+    FAILED_ATTEMPTS[client_ip] = fails
 
 def create_app(config: dict, db, emby_client):
-    app = FastAPI(title="Lemon Emby Admin API", version="1.0.0")
-    secret_key = config.get("server", {}).get("secret_key", "lemon-emby-admin-secret-key-change-me")
+    app = FastAPI(title="Lemon Emby Admin API", version="1.1.0", docs_url=None, redoc_url=None)
+    secret_key = config.get("server", {}).get("secret_key", "")
+    
+    if not secret_key or secret_key == "lemon-emby-admin-secret-key-change-me":
+        logger.critical("⚠️ SECURITY WARNING: Admin secret_key is using the default placeholder! Please change it in config.yaml.")
 
-    async def verify_auth(x_admin_token: Optional[str] = Header(None)):
-        if x_admin_token != secret_key:
+    async def verify_auth(request: Request, x_admin_token: Optional[str] = Header(None)):
+        client_ip = request.client.host if request.client else "unknown"
+        check_ip_rate_limit(client_ip)
+
+        if not x_admin_token or not secrets.compare_digest(x_admin_token, secret_key):
+            record_failed_attempt(client_ip)
+            logger.warning(f"Unauthorized Web API access attempt from {client_ip}")
             raise HTTPException(status_code=401, detail="Unauthorized")
 
     # Static UI
@@ -39,22 +75,21 @@ def create_app(config: dict, db, emby_client):
         return await db.get_all_users()
 
     class GenCodeRequest(BaseModel):
-        card_type: str = "days"
-        value: int = 30
-        count: int = 5
+        card_type: str = Field(default="days", pattern="^(days|points)$")
+        value: int = Field(default=30, ge=1, le=3650)
+        count: int = Field(default=5, ge=1, le=100)
 
     @app.post("/api/codes/generate", dependencies=[Depends(verify_auth)])
     async def generate_codes(req: GenCodeRequest):
-        count = min(req.count, 100)
         codes = []
-        for _ in range(count):
+        for _ in range(req.count):
             c = await db.generate_code(req.card_type, req.value, created_by=0)
             codes.append(c)
         return {"codes": codes}
 
     class StopSessionRequest(BaseModel):
-        session_id: str
-        message: str = "管理员已手动终止播放"
+        session_id: str = Field(min_length=1, max_length=128)
+        message: str = Field(default="管理员已手动终止播放", max_length=200)
 
     @app.post("/api/sessions/kill", dependencies=[Depends(verify_auth)])
     async def kill_session(req: StopSessionRequest):
