@@ -1,0 +1,30 @@
+# 🍋 Lemon Emby Manager & Bot 配置文件示例
+# 复制此文件为 config.yaml 并填入真实配置
+
+server:
+  host: "0.0.0.0"
+  port: 8888
+  secret_key: "lemon-emby-admin-secret-key-change-me"
+
+emby:
+  server_url: "http://127.0.0.1:8096"        # Emby 服务器内网或公网地址
+  api_key: "your_emby_admin_api_key_here"   # Emby 后台生成的管理员 API Key
+  public_url: "https://emby.example.com"     # 发送给用户的 Emby 公网访问地址
+  template_user_id: ""                       # 可选：模板用户 ID（新开号自动继承其媒体库访问权限）
+  default_max_devices: 2                     # 默认允许的最大同时播放设备数
+
+telegram:
+  bot_token: "1234567890:ABCdefGHIjklMNOpqrsTUVwxyz" # Telegram Bot Token
+  admin_ids:                                 # 管理员 Telegram User ID 列表
+    - 7996620779
+  group_id: 0                                # 关联群组 ID（用于群内广播或限制群内绑定）
+  enable_checkin: true                       # 开启每日签到
+  checkin_reward_days: 1                     # 签到赠送天数（为 0 则仅加积分）
+  checkin_points: 10                         # 签到获得积分
+
+rules:
+  check_interval_minutes: 5                  # 巡检周期（分钟）：检查到期、清理过期账号
+  warn_days_before_expiry: 3                 # 提前多少天发送 TG 到期提醒通知
+  auto_disable_expired: true                 # 到期后自动禁用账号（保留数据便于续费）
+  max_concurrency_kill: true                 # 超过最大设备数时，自动阻断/踢出最新多开会话
+  allow_self_reset_password: true            # 允许用户在 TG 个人中心自助重置密码

@@ -1,0 +1,8 @@
+__pycache__/
+*.pyc
+venv/
+.env
+config.yaml
+lemon_emby.db
+*.log
+.DS_Store

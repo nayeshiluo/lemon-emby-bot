@@ -1,0 +1,14 @@
+version: "3.8"
+
+services:
+  lemon-emby-bot:
+    build: .
+    container_name: lemon-emby-bot
+    restart: unless-stopped
+    ports:
+      - "8888:8888"
+    volumes:
+      - ./config.yaml:/app/config.yaml
+      - ./lemon_emby.db:/app/lemon_emby.db
+    environment:
+      - TZ=Asia/Shanghai
