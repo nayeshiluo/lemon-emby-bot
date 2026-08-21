@@ -9,7 +9,7 @@ from typing import Optional, Dict, List, Any
 logger = logging.getLogger("lemon-emby.database")
 
 class Database:
-    """Async SQLite Database for Lemon Emby Manager with Full Economy/Points Support"""
+    """Async SQLite Database for Lemon Emby Manager with Full Economy & Mini-Games"""
     def __init__(self, db_path: str = "lemon_emby.db"):
         self.db_path = db_path
 
@@ -221,38 +221,35 @@ class Database:
         if points < cost:
             return {"success": False, "msg": f"抽奖需要 {cost} 积分，您当前仅有 {points} 积分！"}
 
-        # Deduct cost
         cur_pts = points - cost
-        
-        # Prize pool with weights
         roll = random.random() * 100
         prize = {}
         
-        if roll < 5: # 5% chance: Device +1
+        if roll < 5:
             new_devs = user.get("max_devices", 2) + 1
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("UPDATE users SET points = ?, max_devices = ? WHERE tg_id = ?", (cur_pts, new_devs, tg_id))
                 await db.commit()
             prize = {"type": "grand", "msg": f"🎉 欧皇降临！抽中【并发设备 +1 台】（当前上限: {new_devs} 台）"}
-        elif roll < 20: # 15% chance: +7 Days
+        elif roll < 20:
             new_exp = await self.extend_user_expiry(tg_id, 7)
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (cur_pts, tg_id))
                 await db.commit()
             prize = {"type": "days", "msg": f"🎁 大吉！抽中【7天观影时长】（新到期: {new_exp.strftime('%Y-%m-%d')}）"}
-        elif roll < 45: # 25% chance: +3 Days
+        elif roll < 45:
             new_exp = await self.extend_user_expiry(tg_id, 3)
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (cur_pts, tg_id))
                 await db.commit()
             prize = {"type": "days", "msg": f"✨ 中奖！抽中【3天观影时长】（新到期: {new_exp.strftime('%Y-%m-%d')}）"}
-        elif roll < 75: # 30% chance: +35 Points (Net +15)
+        elif roll < 75:
             cur_pts += 35
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (cur_pts, tg_id))
                 await db.commit()
             prize = {"type": "points", "msg": f"💰 积分红包！抽中【35 积分】（净赚 15 积分）"}
-        else: # 25% chance: No prize
+        else:
             async with aiosqlite.connect(self.db_path) as db:
                 await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (cur_pts, tg_id))
                 await db.commit()
@@ -261,6 +258,164 @@ class Database:
         prize["remaining_points"] = cur_pts
         prize["success"] = True
         return prize
+
+    # --- MINI GAMES SYSTEM ---
+    async def game_dice_bot(self, tg_id: int, bet: int) -> Dict[str, Any]:
+        """PvE Dice roll against Lemon Bot"""
+        user = await self.get_user_by_tg(tg_id)
+        if not user:
+            return {"success": False, "msg": "未绑定 Emby 账号"}
+        if bet <= 0:
+            return {"success": False, "msg": "押注积分必须大于 0"}
+        points = user.get("points", 0)
+        if points < bet:
+            return {"success": False, "msg": f"积分不足！您当前仅有 {points} 积分"}
+
+        user_roll = random.randint(1, 6)
+        bot_roll = random.randint(1, 6)
+
+        if user_roll > bot_roll:
+            # Win 1x bet
+            new_pts = points + bet
+            res_str = f"🎉 <b>您赢了！</b> 赢得 <b>+{bet}</b> 积分！"
+            outcome = "win"
+        elif user_roll < bot_roll:
+            # Lose bet
+            new_pts = points - bet
+            res_str = f"💥 <b>您输了！</b> 损失 <b>-{bet}</b> 积分！"
+            outcome = "lose"
+        else:
+            # Tie
+            new_pts = points
+            res_str = "🤝 <b>平局！</b> 积分已全额退回。"
+            outcome = "tie"
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (new_pts, tg_id))
+            await db.commit()
+
+        return {
+            "success": True,
+            "user_roll": user_roll,
+            "bot_roll": bot_roll,
+            "outcome": outcome,
+            "result_str": res_str,
+            "remaining_points": new_pts
+        }
+
+    async def game_rob(self, from_tg: int, to_tg: int) -> Dict[str, Any]:
+        """Rob points from another user with risk"""
+        if from_tg == to_tg:
+            return {"success": False, "msg": "你不能抢劫你自己！"}
+
+        u_from = await self.get_user_by_tg(from_tg)
+        if not u_from:
+            return {"success": False, "msg": "打劫者未绑定 Emby 账号"}
+
+        u_to = await self.get_user_by_tg(to_tg)
+        if not u_to:
+            return {"success": False, "msg": "目标群友未绑定 Emby 账号，身无分文！"}
+
+        from_pts = u_from.get("points", 0)
+        to_pts = u_to.get("points", 0)
+
+        if from_pts < 15:
+            return {"success": False, "msg": "打劫需要至少 15 积分作为行动经费（以防打劫失败被反杀赔偿）！"}
+
+        if to_pts < 30:
+            return {"success": False, "msg": f"目标用户 <code>{u_to['emby_username']}</code> 太穷了（积分低于 30），触发新手贫困保护！"}
+
+        # 45% success rate
+        is_success = random.random() < 0.45
+
+        if is_success:
+            # Rob 10% to 25% of target points (max 80 pts)
+            percent = random.randint(10, 25) / 100.0
+            robbed_amount = min(80, max(5, int(to_pts * percent)))
+            
+            new_from_pts = from_pts + robbed_amount
+            new_to_pts = to_pts - robbed_amount
+
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (new_from_pts, from_tg))
+                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (new_to_pts, to_tg))
+                await db.commit()
+
+            await self.log_action(from_tg, "ROB_SUCCESS", f"Robbed {robbed_amount} pts from TG:{to_tg}")
+            return {
+                "success": True,
+                "status": "win",
+                "robbed_amount": robbed_amount,
+                "victim_name": u_to.get("emby_username"),
+                "from_pts": new_from_pts,
+                "to_pts": new_to_pts
+            }
+        else:
+            # Failed and got countered! Pay 15 pts penalty to victim
+            penalty = 15
+            new_from_pts = from_pts - penalty
+            new_to_pts = to_pts + penalty
+
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (new_from_pts, from_tg))
+                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (new_to_pts, to_tg))
+                await db.commit()
+
+            await self.log_action(from_tg, "ROB_FAIL", f"Failed robbing TG:{to_tg}, lost {penalty} pts")
+            return {
+                "success": True,
+                "status": "lose",
+                "penalty": penalty,
+                "victim_name": u_to.get("emby_username"),
+                "from_pts": new_from_pts,
+                "to_pts": new_to_pts
+            }
+
+    async def game_pvp_dice_resolve(self, u1_tg: int, u2_tg: int, bet: int) -> Dict[str, Any]:
+        """Resolve PvP dice between two users"""
+        u1 = await self.get_user_by_tg(u1_tg)
+        u2 = await self.get_user_by_tg(u2_tg)
+        if not u1 or not u2:
+            return {"success": False, "msg": "双方需均已绑定 Emby 账号"}
+        
+        if u1.get("points", 0) < bet or u2.get("points", 0) < bet:
+            return {"success": False, "msg": "其中一方积分不足以支付赌注！"}
+
+        u1_roll = random.randint(1, 6)
+        u2_roll = random.randint(1, 6)
+
+        if u1_roll > u2_roll:
+            winner_tg = u1_tg
+            loser_tg = u2_tg
+            winner_name = u1.get("emby_username")
+            loser_name = u2.get("emby_username")
+            outcome = "u1_win"
+            await self.add_user_points(u1_tg, bet)
+            await self.add_user_points(u2_tg, -bet)
+        elif u2_roll > u1_roll:
+            winner_tg = u2_tg
+            loser_tg = u1_tg
+            winner_name = u2.get("emby_username")
+            loser_name = u1.get("emby_username")
+            outcome = "u2_win"
+            await self.add_user_points(u2_tg, bet)
+            await self.add_user_points(u1_tg, -bet)
+        else:
+            outcome = "tie"
+            winner_name = None
+            loser_name = None
+
+        return {
+            "success": True,
+            "outcome": outcome,
+            "u1_roll": u1_roll,
+            "u2_roll": u2_roll,
+            "u1_name": u1.get("emby_username"),
+            "u2_name": u2.get("emby_username"),
+            "winner_name": winner_name,
+            "loser_name": loser_name,
+            "bet": bet
+        }
 
     async def transfer_points(self, from_tg: int, to_tg: int, amount: int) -> Dict[str, Any]:
         """Transfer points from one user to another"""

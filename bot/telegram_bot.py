@@ -2,6 +2,7 @@ import logging
 import datetime
 import secrets
 import string
+import random
 from typing import Dict, Any, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -16,7 +17,7 @@ from telegram.ext import (
 logger = logging.getLogger("lemon-emby.bot")
 
 class LemonEmbyBot:
-    """Telegram Bot with Rich Inline Keyboards, Full Points Economy and Admin Controls"""
+    """Telegram Bot with Rich Inline Keyboards, Economy, and Interactive Mini-Games"""
     def __init__(self, token: str, config: dict, db, emby_client):
         self.token = token
         self.config = config
@@ -24,6 +25,7 @@ class LemonEmbyBot:
         self.emby = emby_client
         self.admin_ids = config.get("telegram", {}).get("admin_ids", [])
         self.app = Application.builder().token(token).build()
+        self.pending_duels = {}  # {challenge_id: {u1_tg, u2_tg, bet, time}}
         self._register_handlers()
 
     def _is_admin(self, user_id: int) -> bool:
@@ -44,6 +46,11 @@ class LemonEmbyBot:
         self.app.add_handler(CommandHandler(["lottery", "draw", "chou"], self.cmd_lottery))
         self.app.add_handler(CommandHandler(["transfer", "pay", "sendpts"], self.cmd_transfer))
         self.app.add_handler(CommandHandler(["rank", "top", "leaderboard"], self.cmd_rank))
+
+        # Gaming Modes (PK / Dice / Rob)
+        self.app.add_handler(CommandHandler(["dice", "touzi"], self.cmd_dice))
+        self.app.add_handler(CommandHandler(["rob", "steal", "qiang"], self.cmd_rob))
+        self.app.add_handler(CommandHandler(["duel", "pk"], self.cmd_duel))
 
         # Query & Lookup
         self.app.add_handler(CommandHandler(["info", "check", "whois", "user"], self.cmd_info))
@@ -81,12 +88,16 @@ class LemonEmbyBot:
                 InlineKeyboardButton("🎰 幸运抽奖", callback_data="cb_lottery")
             ],
             [
-                InlineKeyboardButton("🎟️ 兑换卡密", callback_data="cb_redeem_info"),
+                InlineKeyboardButton("🎲 掷骰对决", callback_data="cb_game_dice_menu"),
                 InlineKeyboardButton("🏆 积分富豪榜", callback_data="cb_rank")
             ],
             [
-                InlineKeyboardButton("🌐 线路节点", callback_data="cb_lines"),
-                InlineKeyboardButton("📱 客户端推荐", callback_data="cb_clients")
+                InlineKeyboardButton("🎟️ 兑换卡密", callback_data="cb_redeem_info"),
+                InlineKeyboardButton("🌐 线路节点", callback_data="cb_lines")
+            ],
+            [
+                InlineKeyboardButton("📱 客户端推荐", callback_data="cb_clients"),
+                InlineKeyboardButton("🔄 刷新状态", callback_data="cb_refresh")
             ]
         ]
         if is_admin:
@@ -118,8 +129,8 @@ class LemonEmbyBot:
             f"📌 <b>常用操作：</b>\n"
             f"• 点击 <b>【👤 个人中心】</b> 查看账号与剩余天数\n"
             f"• 每日 <b>【🎁 每日签到】</b> 免费领取时长与积分\n"
-            f"• 逛逛 <b>【🛒 积分商城】</b> 用积分免费兑换时长与设备数\n"
-            f"• 试试 <b>【🎰 幸运抽奖】</b> 赢取永久设备数与大额时长\n\n"
+            f"• 逛逛 <b>【🛒 积分商城】</b> 兑换观影时长与并发设备\n"
+            f"• 参与 <b>【🎲 游戏娱乐】</b> 体验掷骰对决、群友PK与打劫\n\n"
             f"🎬 <i>祝你观影愉快！</i>"
         )
         await update.message.reply_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
@@ -131,9 +142,11 @@ class LemonEmbyBot:
             "• <code>/start</code> - 打开主控制面板\n"
             "• <code>/my</code> - 查看个人账号信息与到期时间\n"
             "• <code>/checkin</code> - 每日签到领时长与积分\n"
-            "• <code>/shop</code> - 积分商城（用积分换时长/并发设备）\n"
-            "• <code>/lottery</code> - 积分幸运抽奖（20积分/次）\n"
-            "• <code>/transfer &lt;用户名/TG_ID&gt; &lt;积分&gt;</code> - 积分转账给群友\n"
+            "• <code>/shop</code> - 积分商城（换时长/并发设备）\n"
+            "• <code>/lottery</code> - 积分幸运抽奖（20分/次）\n"
+            "• <code>/dice [押注]</code> - 掷骰子比大小（回复群友发起PK，或单人挑战Bot）\n"
+            "• <code>/rob</code> - 打劫群友积分（回复某人发送，有反杀风险）\n"
+            "• <code>/transfer &lt;用户&gt; &lt;积分&gt;</code> - 积分转账给群友\n"
             "• <code>/rank</code> - 查看群内积分富豪榜\n"
             "• <code>/bind &lt;账号&gt; &lt;密码&gt;</code> - 开通或绑定 Emby 账号\n"
             "• <code>/redeem &lt;卡密&gt;</code> - 使用兑换码续费\n"
@@ -184,6 +197,113 @@ class LemonEmbyBot:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💡 <i>提示：发送 <code>/resetpw 新密码</code> 可自助修改密码。</i>"
         )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    # --- GAMING MODES: DICE, ROB, PK DUEL ---
+    async def cmd_dice(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        sender_id = update.effective_user.id
+        args = context.args
+        reply_msg = update.message.reply_to_message
+
+        bet = 10
+        if args and args[0].isdigit():
+            bet = int(args[0])
+
+        if reply_msg and reply_msg.from_user and reply_msg.from_user.id != sender_id:
+            # PvP Duel challenge
+            target_user = reply_msg.from_user
+            duel_id = secrets.token_hex(4)
+            self.pending_duels[duel_id] = {
+                "u1_tg": sender_id,
+                "u2_tg": target_user.id,
+                "u1_name": update.effective_user.first_name,
+                "u2_name": target_user.first_name,
+                "bet": bet,
+                "time": datetime.datetime.now()
+            }
+
+            kb = InlineKeyboardMarkup([
+                [
+                    InlineKeyboardButton("⚔️ 接受对决！", callback_data=f"cb_accept_duel_{duel_id}"),
+                    InlineKeyboardButton("🏳️ 认怂拒绝", callback_data=f"cb_reject_duel_{duel_id}")
+                ]
+            ])
+            text = (
+                f"⚔️ <b>掷骰 PK 决斗挑战发起！</b>\n\n"
+                f"👤 <b>发起者：</b> {update.effective_user.first_name}\n"
+                f"🎯 <b>应战方：</b> {target_user.first_name}\n"
+                f"💰 <b>押注积分：</b> <b>{bet}</b> PTS\n\n"
+                f"<i>请应战方点击下方按钮应战（60秒内有效）！</i>"
+            )
+            await update.message.reply_text(text, reply_markup=kb, parse_mode="HTML")
+            return
+
+        # PvE Solo roll against Lemon Bot
+        res = await self.db.game_dice_bot(sender_id, bet)
+        if not res.get("success"):
+            await update.message.reply_text(f"⚠️ {res.get('msg')}")
+            return
+
+        dice_emojis = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"]
+        u_dice = dice_emojis[res['user_roll'] - 1]
+        b_dice = dice_emojis[res['bot_roll'] - 1]
+
+        text = (
+            f"🎲 <b>人机掷骰对决结果</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 您掷出了：{u_dice} <b>({res['user_roll']} 点)</b>\n"
+            f"🍋 柠檬掷出：{b_dice} <b>({res['bot_roll']} 点)</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"{res['result_str']}\n"
+            f"💎 剩余总积分：<code>{res['remaining_points']}</code> PTS"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_duel(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        await self.cmd_dice(update, context)
+
+    async def cmd_rob(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        from_id = update.effective_user.id
+        reply_msg = update.message.reply_to_message
+        args = context.args
+
+        to_id = None
+        if reply_msg and reply_msg.from_user:
+            to_id = reply_msg.from_user.id
+        elif args:
+            target_str = args[0].strip()
+            if target_str.isdigit():
+                to_id = int(target_str)
+            else:
+                target_u = await self.db.get_user_by_username(target_str.lstrip("@"))
+                if target_u:
+                    to_id = target_u["tg_id"]
+
+        if not to_id:
+            await update.message.reply_text("💡 <b>打劫玩法：</b>\n长按/回复你想打劫的群友消息，发送 <code>/rob</code>", parse_mode="HTML")
+            return
+
+        res = await self.db.game_rob(from_id, to_id)
+        if not res.get("success"):
+            await update.message.reply_text(f"⚠️ {res.get('msg')}", parse_mode="HTML")
+            return
+
+        if res["status"] == "win":
+            text = (
+                f"🥷 <b>打劫大成功！劫富济贫！</b>\n\n"
+                f"👤 劫匪：<b>{update.effective_user.first_name}</b>\n"
+                f"🎯 受害者：<code>{res['victim_name']}</code>\n"
+                f"💰 成功掠夺：<b>+{res['robbed_amount']}</b> 积分！\n\n"
+                f"<i>受害者已被洗劫，劫匪潇洒离去~</i>"
+            )
+        else:
+            text = (
+                f"💥 <b>打劫翻车！被当场反杀！</b>\n\n"
+                f"👤 劫匪：<b>{update.effective_user.first_name}</b>\n"
+                f"🛡️ 勇士：<code>{res['victim_name']}</code>\n"
+                f"💸 赔偿罚金：<b>-{res['penalty']}</b> 积分（已直接转入受害者账户）\n\n"
+                f"<i>偷鸡不成蚀把米，受害者笑嘻嘻收下赔款！</i>"
+            )
         await update.message.reply_text(text, parse_mode="HTML")
 
     # --- POINTS & ECONOMY HANDLERS ---
@@ -343,7 +463,6 @@ class LemonEmbyBot:
 
     # --- LOOKUP / INFO ---
     async def cmd_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
-        """Query user details by replying to a message or providing identifier"""
         sender_id = update.effective_user.id
         is_admin = self._is_admin(sender_id)
         args = context.args
@@ -380,7 +499,6 @@ class LemonEmbyBot:
         delta_days = (expiry - now).days
         status_tag = "🔴 已过期/冻结" if (delta_days < 0 or u_db.get("is_disabled")) else f"🟢 正常 (剩余 {delta_days} 天)"
 
-        # Live playback
         playing_info = "💤 当前空闲"
         sessions = await self.emby.get_active_sessions()
         user_sessions = [s for s in sessions if s.get("UserId") == u_db.get("emby_user_id")]
@@ -775,6 +893,63 @@ class LemonEmbyBot:
         if data == "cb_main_menu":
             await query.edit_message_text("🍋 <b>主控制面板</b>", reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
 
+        elif data == "cb_game_dice_menu":
+            text = (
+                "🎲 <b>游戏娱乐大厅</b>\n\n"
+                "1️⃣ <b>单人挑战柠檬：</b> 发送 <code>/dice 20</code> 与机器人比大小\n"
+                "2️⃣ <b>群友掷骰 PK：</b> 引用群友消息发送 <code>/dice 50</code> 发起决斗\n"
+                "3️⃣ <b>积分打劫：</b> 引用群友消息发送 <code>/rob</code> 劫富济贫\n"
+                "4️⃣ <b>幸运抽奖：</b> 发送 <code>/lottery</code> 或点击下方按钮"
+            )
+            kb = InlineKeyboardMarkup([
+                [InlineKeyboardButton("🎰 幸运大转盘", callback_data="cb_lottery")],
+                [InlineKeyboardButton("🔙 返回主菜单", callback_data="cb_main_menu")]
+            ])
+            await query.edit_message_text(text, reply_markup=kb, parse_mode="HTML")
+
+        elif data.startswith("cb_accept_duel_"):
+            duel_id = data.replace("cb_accept_duel_", "")
+            duel = self.pending_duels.pop(duel_id, None)
+            if not duel:
+                await query.edit_message_text("⚠️ 决斗已失效或已超时！")
+                return
+            
+            if user_id != duel["u2_tg"]:
+                await query.answer("这不是发给你的决斗挑战哦！", show_alert=True)
+                return
+
+            res = await self.db.game_pvp_dice_resolve(duel["u1_tg"], duel["u2_tg"], duel["bet"])
+            if not res.get("success"):
+                await query.edit_message_text(f"⚠️ 对决失败：{res.get('msg')}")
+                return
+
+            dice_emojis = ["⚀", "⚁", "⚂", "⚃", "⚄", "⚅"]
+            d1 = dice_emojis[res['u1_roll'] - 1]
+            d2 = dice_emojis[res['u2_roll'] - 1]
+
+            if res["outcome"] == "tie":
+                res_text = "🤝 <b>势均力敌！双方平局！</b> 积分已全额保留。"
+            else:
+                res_text = f"👑 <b>恭喜胜者：<code>{res['winner_name']}</code>！</b>\n💰 赢取赌注：<b>+{res['bet']}</b> 积分！"
+
+            text = (
+                f"⚔️ <b>掷骰 PK 决斗结果揭晓！</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"👤 <b>{res['u1_name']}：</b> {d1} <b>({res['u1_roll']} 点)</b>\n"
+                f"👤 <b>{res['u2_name']}：</b> {d2} <b>({res['u2_roll']} 点)</b>\n"
+                f"━━━━━━━━━━━━━━━━━━━━\n"
+                f"{res_text}"
+            )
+            await query.edit_message_text(text, parse_mode="HTML")
+
+        elif data.startswith("cb_reject_duel_"):
+            duel_id = data.replace("cb_reject_duel_", "")
+            duel = self.pending_duels.pop(duel_id, None)
+            if duel:
+                await query.edit_message_text(f"🏳️ 应战方已认怂拒绝了决斗！")
+            else:
+                await query.edit_message_text("决斗已关闭")
+
         elif data == "cb_my":
             u = await self.db.get_user_by_tg(user_id)
             if not u:
@@ -888,6 +1063,9 @@ class LemonEmbyBot:
                 "• <b>PC / Mac:</b> Emby Theater, 网页端\n"
             )
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
+
+        elif data == "cb_refresh":
+            await query.edit_message_text("🔄 状态已刷新！", reply_markup=self._get_main_keyboard(is_admin))
 
         elif data == "cb_admin_panel" and is_admin:
             sys_info = await self.emby.get_system_info()
