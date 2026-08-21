@@ -1,6 +1,7 @@
 import aiosqlite
 import datetime
 import secrets
+import random
 import string
 import logging
 from typing import Optional, Dict, List, Any
@@ -8,7 +9,7 @@ from typing import Optional, Dict, List, Any
 logger = logging.getLogger("lemon-emby.database")
 
 class Database:
-    """Async SQLite Database for Lemon Emby Manager"""
+    """Async SQLite Database for Lemon Emby Manager with Full Economy/Points Support"""
     def __init__(self, db_path: str = "lemon_emby.db"):
         self.db_path = db_path
 
@@ -113,6 +114,16 @@ class Database:
             await db.commit()
         return new_expiry
 
+    async def add_user_points(self, tg_id: int, delta: int) -> int:
+        """Add or subtract user points, returns new total"""
+        user = await self.get_user_by_tg(tg_id)
+        current = user.get("points", 0) if user else 0
+        new_pts = max(0, current + delta)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (new_pts, tg_id))
+            await db.commit()
+        return new_pts
+
     async def update_user_status(self, tg_id: int, is_disabled: bool):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("UPDATE users SET is_disabled = ? WHERE tg_id = ?", (1 if is_disabled else 0, tg_id))
@@ -152,6 +163,145 @@ class Database:
             "new_expiry": new_expiry.strftime("%Y-%m-%d %H:%M")
         }
 
+    async def exchange_item(self, tg_id: int, item_key: str) -> Dict[str, Any]:
+        """Points Shop Exchange items"""
+        shop_items = {
+            "days_7": {"name": "7天观影时长", "cost": 50, "type": "days", "val": 7},
+            "days_30": {"name": "30天观影时长", "cost": 180, "type": "days", "val": 30},
+            "days_90": {"name": "90天观影时长", "cost": 500, "type": "days", "val": 90},
+            "dev_plus1": {"name": "并发设备限制 +1 台", "cost": 300, "type": "dev", "val": 1}
+        }
+        item = shop_items.get(item_key)
+        if not item:
+            return {"success": False, "msg": "无效的商品"}
+
+        user = await self.get_user_by_tg(tg_id)
+        if not user:
+            return {"success": False, "msg": "未绑定 Emby 账号"}
+
+        points = user.get("points", 0)
+        cost = item["cost"]
+        if points < cost:
+            return {"success": False, "msg": f"积分不足！需要 {cost} 积分，您当前仅有 {points} 积分。"}
+
+        new_points = points - cost
+        async with aiosqlite.connect(self.db_path) as db:
+            if item["type"] == "days":
+                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (new_points, tg_id))
+                await db.commit()
+                new_exp = await self.extend_user_expiry(tg_id, item["val"])
+                return {
+                    "success": True,
+                    "item_name": item["name"],
+                    "cost": cost,
+                    "remaining_points": new_points,
+                    "details": f"到期时间已延长至: {new_exp.strftime('%Y-%m-%d %H:%M')}"
+                }
+            elif item["type"] == "dev":
+                new_devs = user.get("max_devices", 2) + item["val"]
+                await db.execute("UPDATE users SET points = ?, max_devices = ? WHERE tg_id = ?", (new_points, new_devs, tg_id))
+                await db.commit()
+                return {
+                    "success": True,
+                    "item_name": item["name"],
+                    "cost": cost,
+                    "remaining_points": new_points,
+                    "details": f"允许最大并发设备数已提升至: {new_devs} 台"
+                }
+
+        return {"success": False, "msg": "未知兑换类型"}
+
+    async def lottery_draw(self, tg_id: int, cost: int = 20) -> Dict[str, Any]:
+        """Lottery / Lucky Draw using points"""
+        user = await self.get_user_by_tg(tg_id)
+        if not user:
+            return {"success": False, "msg": "未绑定 Emby 账号"}
+        
+        points = user.get("points", 0)
+        if points < cost:
+            return {"success": False, "msg": f"抽奖需要 {cost} 积分，您当前仅有 {points} 积分！"}
+
+        # Deduct cost
+        cur_pts = points - cost
+        
+        # Prize pool with weights
+        roll = random.random() * 100
+        prize = {}
+        
+        if roll < 5: # 5% chance: Device +1
+            new_devs = user.get("max_devices", 2) + 1
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("UPDATE users SET points = ?, max_devices = ? WHERE tg_id = ?", (cur_pts, new_devs, tg_id))
+                await db.commit()
+            prize = {"type": "grand", "msg": f"🎉 欧皇降临！抽中【并发设备 +1 台】（当前上限: {new_devs} 台）"}
+        elif roll < 20: # 15% chance: +7 Days
+            new_exp = await self.extend_user_expiry(tg_id, 7)
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (cur_pts, tg_id))
+                await db.commit()
+            prize = {"type": "days", "msg": f"🎁 大吉！抽中【7天观影时长】（新到期: {new_exp.strftime('%Y-%m-%d')}）"}
+        elif roll < 45: # 25% chance: +3 Days
+            new_exp = await self.extend_user_expiry(tg_id, 3)
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (cur_pts, tg_id))
+                await db.commit()
+            prize = {"type": "days", "msg": f"✨ 中奖！抽中【3天观影时长】（新到期: {new_exp.strftime('%Y-%m-%d')}）"}
+        elif roll < 75: # 30% chance: +35 Points (Net +15)
+            cur_pts += 35
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (cur_pts, tg_id))
+                await db.commit()
+            prize = {"type": "points", "msg": f"💰 积分红包！抽中【35 积分】（净赚 15 积分）"}
+        else: # 25% chance: No prize
+            async with aiosqlite.connect(self.db_path) as db:
+                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (cur_pts, tg_id))
+                await db.commit()
+            prize = {"type": "none", "msg": "☕ 差点就中了！获得了【赛博安慰奖：功德 +1】"}
+
+        prize["remaining_points"] = cur_pts
+        prize["success"] = True
+        return prize
+
+    async def transfer_points(self, from_tg: int, to_tg: int, amount: int) -> Dict[str, Any]:
+        """Transfer points from one user to another"""
+        if amount <= 0:
+            return {"success": False, "msg": "转账积分必须大于 0"}
+        if from_tg == to_tg:
+            return {"success": False, "msg": "不能给自己转账"}
+
+        u_from = await self.get_user_by_tg(from_tg)
+        if not u_from:
+            return {"success": False, "msg": "转账方未绑定 Emby 账号"}
+        
+        u_to = await self.get_user_by_tg(to_tg)
+        if not u_to:
+            return {"success": False, "msg": "收款方未绑定 Emby 账号"}
+
+        from_pts = u_from.get("points", 0)
+        if from_pts < amount:
+            return {"success": False, "msg": f"您的积分不足！当前仅有 {from_pts} 积分"}
+
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("UPDATE users SET points = points - ? WHERE tg_id = ?", (amount, from_tg))
+            await db.execute("UPDATE users SET points = points + ? WHERE tg_id = ?", (amount, to_tg))
+            await db.commit()
+
+        await self.log_action(from_tg, "TRANSFER_POINTS", f"Sent {amount} pts to TG:{to_tg}")
+        return {
+            "success": True,
+            "amount": amount,
+            "from_remaining": from_pts - amount,
+            "to_username": u_to.get("emby_username")
+        }
+
+    async def get_leaderboard(self, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get points & days ranking"""
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM users ORDER BY points DESC LIMIT ?", (limit,)) as cursor:
+                rows = await cursor.fetchall()
+                return [dict(r) for r in rows]
+
     async def generate_code(self, card_type: str, value: int, created_by: int = 0) -> str:
         """Generate a random unique card key"""
         chars = string.ascii_uppercase + string.digits
@@ -189,11 +339,7 @@ class Database:
             new_exp = await self.extend_user_expiry(tg_id, val)
             return {"success": True, "type": "days", "value": val, "new_expiry": new_exp.strftime("%Y-%m-%d %H:%M") if new_exp else ""}
         elif card_type == "points":
-            user = await self.get_user_by_tg(tg_id)
-            new_pts = (user.get("points", 0) if user else 0) + val
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("UPDATE users SET points = ? WHERE tg_id = ?", (new_pts, tg_id))
-                await db.commit()
+            new_pts = await self.add_user_points(tg_id, val)
             return {"success": True, "type": "points", "value": val, "total_points": new_pts}
         
         return {"success": True, "type": card_type, "value": val}
