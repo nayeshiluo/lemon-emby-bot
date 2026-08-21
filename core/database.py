@@ -65,6 +65,21 @@ class Database:
                 row = await cursor.fetchone()
                 return dict(row) if row else None
 
+    async def get_user_by_username(self, username: str) -> Optional[Dict[str, Any]]:
+        async with aiosqlite.connect(self.db_path) as db:
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM users WHERE LOWER(emby_username) = LOWER(?)", (username,)) as cursor:
+                row = await cursor.fetchone()
+                return dict(row) if row else None
+
+    async def get_user_by_identifier(self, identifier: str) -> Optional[Dict[str, Any]]:
+        """Look up by TG ID (if integer) or username"""
+        if identifier.isdigit() or (identifier.startswith("-") and identifier[1:].isdigit()):
+            u = await self.get_user_by_tg(int(identifier))
+            if u:
+                return u
+        return await self.get_user_by_username(identifier)
+
     async def get_all_users(self) -> List[Dict[str, Any]]:
         async with aiosqlite.connect(self.db_path) as db:
             db.row_factory = aiosqlite.Row
@@ -101,6 +116,11 @@ class Database:
     async def update_user_status(self, tg_id: int, is_disabled: bool):
         async with aiosqlite.connect(self.db_path) as db:
             await db.execute("UPDATE users SET is_disabled = ? WHERE tg_id = ?", (1 if is_disabled else 0, tg_id))
+            await db.commit()
+
+    async def delete_user_record(self, tg_id: int):
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("DELETE FROM users WHERE tg_id = ?", (tg_id,))
             await db.commit()
 
     async def user_checkin(self, tg_id: int, reward_days: int = 1, points: int = 10) -> Dict[str, Any]:

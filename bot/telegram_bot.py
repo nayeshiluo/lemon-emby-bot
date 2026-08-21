@@ -1,6 +1,8 @@
 import logging
 import datetime
-from typing import Dict, Any, List
+import secrets
+import string
+from typing import Dict, Any, List, Optional
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
     Application,
@@ -36,7 +38,12 @@ class LemonEmbyBot:
         self.app.add_handler(CommandHandler("redeem", self.cmd_redeem))
         self.app.add_handler(CommandHandler("resetpw", self.cmd_resetpw))
         
-        # Admin Commands
+        # User & Admin Query Commands (Supports Reply & Explicit args)
+        self.app.add_handler(CommandHandler(["info", "check", "whois", "user"], self.cmd_info))
+        
+        # Admin Commands (Supports Reply & Explicit args)
+        self.app.add_handler(CommandHandler(["create", "open", "adduser"], self.cmd_create))
+        self.app.add_handler(CommandHandler(["deluser", "rmuser", "delete"], self.cmd_deluser))
         self.app.add_handler(CommandHandler("gen", self.cmd_gen))
         self.app.add_handler(CommandHandler("status", self.cmd_status))
         self.app.add_handler(CommandHandler("users", self.cmd_users))
@@ -99,9 +106,13 @@ class LemonEmbyBot:
             "• <code>/bind &lt;账号&gt; &lt;密码&gt;</code> - 开通或绑定 Emby 账号\n"
             "• <code>/redeem &lt;卡密&gt;</code> - 使用兑换码续费\n"
             "• <code>/resetpw &lt;新密码&gt;</code> - 自助修改 Emby 密码\n"
+            "• <code>/info</code> - 查看账号状态（支持回复他人消息查号）\n"
         )
         admin_help = (
-            "\n👑 <b>管理员特权指令：</b>\n"
+            "\n👑 <b>管理员特权快捷指令：</b>\n"
+            "• <b>一键开号：</b> 回复某人消息发送 <code>/create [天数] [初始密码]</code>，或 <code>/create &lt;用户名&gt; [密码] [天数]</code>\n"
+            "• <b>一键查号：</b> 回复某人消息发送 <code>/info</code>，或 <code>/info &lt;用户名/TG_ID&gt;</code>\n"
+            "• <b>一键销号：</b> 回复某人消息发送 <code>/deluser</code>，或 <code>/deluser &lt;用户名/TG_ID&gt;</code>\n"
             "• <code>/gen &lt;天数&gt; [张数]</code> - 批量生成天数卡密\n"
             "• <code>/status</code> - 查看 Emby 服务器状态与当前播放\n"
             "• <code>/users</code> - 列出最近注册用户\n"
@@ -142,6 +153,231 @@ class LemonEmbyBot:
             f"💡 <i>提示：发送 <code>/resetpw 新密码</code> 可自助修改密码。</i>"
         )
         await update.message.reply_text(text, parse_mode="HTML")
+
+    async def cmd_info(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Query user details by replying to a message or providing identifier"""
+        sender_id = update.effective_user.id
+        is_admin = self._is_admin(sender_id)
+        args = context.args
+        reply_msg = update.message.reply_to_message
+
+        u_db = None
+        target_tg_id = None
+        target_name = None
+
+        if reply_msg and reply_msg.from_user:
+            # Mode A: Reply to a user's message
+            target_user = reply_msg.from_user
+            target_tg_id = target_user.id
+            target_name = target_user.first_name or target_user.username
+            u_db = await self.db.get_user_by_tg(target_tg_id)
+        elif args:
+            # Mode B: Explicit argument
+            identifier = args[0].strip()
+            u_db = await self.db.get_user_by_identifier(identifier)
+            if not u_db:
+                # Also check directly on Emby
+                emby_u = await self.emby.get_user_by_name(identifier)
+                if emby_u:
+                    u_db = await self.db.get_user_by_emby_id(emby_u["Id"])
+        else:
+            # Mode C: Self query
+            target_tg_id = sender_id
+            u_db = await self.db.get_user_by_tg(sender_id)
+
+        if not u_db:
+            who = f"用户 <code>{target_name or (args[0] if args else '您')}</code>"
+            await update.message.reply_text(f"❌ 未查询到 {who} 的 Emby 绑定信息！", parse_mode="HTML")
+            return
+
+        # Check permission: non-admin can only check their own
+        if not is_admin and u_db.get("tg_id") != sender_id:
+            await update.message.reply_text("🔒 仅管理员可查询其他用户的详细档案！", parse_mode="HTML")
+            return
+
+        expiry = datetime.datetime.fromisoformat(u_db["expiry_date"])
+        now = datetime.datetime.now(datetime.timezone.utc)
+        delta_days = (expiry - now).days
+        status_tag = "🔴 已过期/冻结" if (delta_days < 0 or u_db.get("is_disabled")) else f"🟢 正常 (剩余 {delta_days} 天)"
+
+        # Check live playback
+        playing_info = "💤 当前空闲"
+        sessions = await self.emby.get_active_sessions()
+        user_sessions = [s for s in sessions if s.get("UserId") == u_db.get("emby_user_id")]
+        if user_sessions:
+            items = []
+            for s in user_sessions:
+                dev = s.get("DeviceName", "未知设备")
+                media = s.get("NowPlayingItem", {}).get("Name", "媒体")
+                items.append(f"• <b>{dev}</b>: <i>{media}</i>")
+            playing_info = f"🔥 <b>正在播放中 ({len(user_sessions)} 台设备)：</b>\n" + "\n".join(items)
+
+        text = (
+            f"🔍 <b>Emby 用户状态档案</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>Emby 账号：</b> <code>{u_db['emby_username']}</code>\n"
+            f"🆔 <b>Telegram ID：</b> <code>{u_db['tg_id']}</code>\n"
+            f"📶 <b>账号状态：</b> {status_tag}\n"
+            f"⏳ <b>到期时间：</b> <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code>\n"
+            f"💎 <b>账户积分：</b> <code>{u_db.get('points', 0)}</code> PTS\n"
+            f"📱 <b>最大设备限制：</b> <code>{u_db.get('max_devices', 2)}</code> 台\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"🎬 <b>播放状态：</b>\n{playing_info}"
+        )
+        await update.message.reply_text(text, parse_mode="HTML")
+
+    # --- ADMIN: ONE-CLICK CREATE USER (REPLY OR EXPLICIT) ---
+    async def cmd_create(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin command to create/open account by replying to a user message or specifying arguments"""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        reply_msg = update.message.reply_to_message
+        args = context.args
+
+        target_tg_id = None
+        username = None
+        password = None
+        days = 30
+
+        if reply_msg and reply_msg.from_user:
+            # Mode 1: Reply to someone's message in group/DM
+            # Usage: /create [天数] [密码] [指定用户名]
+            target_user = reply_msg.from_user
+            target_tg_id = target_user.id
+            
+            # Default username from TG username or first_name or ID
+            if target_user.username:
+                username = target_user.username
+            else:
+                username = f"u_{target_user.id}"
+
+            # Parse optional arguments: e.g. /create 60 pass123 or /create 60
+            if args:
+                if args[0].isdigit():
+                    days = int(args[0])
+                    if len(args) > 1:
+                        password = args[1]
+                    if len(args) > 2:
+                        username = args[2]
+                else:
+                    username = args[0]
+                    if len(args) > 1:
+                        password = args[1]
+                    if len(args) > 2 and args[2].isdigit():
+                        days = int(args[2])
+
+            if not password:
+                # Random 8-character password
+                password = "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
+        else:
+            # Mode 2: Explicit command: /create <用户名> [密码] [天数] [tg_id]
+            if not args:
+                await update.message.reply_text(
+                    "💡 <b>一键开号指令说明：</b>\n\n"
+                    "1️⃣ <b>回复开号：</b> 选中群友消息直接回复 <code>/create [天数] [密码]</code>\n"
+                    "2️⃣ <b>直接开号：</b> <code>/create &lt;用户名&gt; [密码] [天数] [TG_ID]</code>",
+                    parse_mode="HTML"
+                )
+                return
+
+            username = args[0].strip()
+            password = args[1].strip() if len(args) > 1 else "".join(secrets.choice(string.ascii_letters + string.digits) for _ in range(8))
+            days = int(args[2]) if len(args) > 2 and args[2].isdigit() else 30
+            target_tg_id = int(args[3]) if len(args) > 3 and args[3].isdigit() else 0
+
+        # Check existing user
+        if target_tg_id:
+            existing = await self.db.get_user_by_tg(target_tg_id)
+            if existing:
+                await update.message.reply_text(
+                    f"⚠️ 该用户 (TG: <code>{target_tg_id}</code>) 已绑定 Emby 账号：<code>{existing['emby_username']}</code>！\n"
+                    f"如需延期请使用 <code>/addtime {existing['emby_username']} {days}</code>。",
+                    parse_mode="HTML"
+                )
+                return
+
+        # Check existing on Emby
+        emby_u = await self.emby.get_user_by_name(username)
+        if emby_u:
+            emby_user_id = emby_u["Id"]
+            await self.emby.update_user_password(emby_user_id, password)
+            await self.emby.set_user_disabled(emby_user_id, False)
+        else:
+            new_u = await self.emby.create_user(username, password)
+            if not new_u:
+                await update.message.reply_text("❌ Emby 服务器开号失败，请检查服务器连接或 API Key！")
+                return
+            emby_user_id = new_u["Id"]
+
+        # Record into Database
+        tg_id_to_save = target_tg_id or int(f"99{secrets.randbelow(1000000)}")
+        await self.db.create_user_record(tg_id_to_save, emby_user_id, username, days=days)
+        await self.db.log_action(update.effective_user.id, "ADMIN_CREATE", f"Created {username} for TG:{target_tg_id} days:{days}")
+
+        public_url = self.config.get("emby", {}).get("public_url", "https://emby.example.com")
+        
+        reply_card = (
+            f"🎉 <b>Emby 账号一键开通成功！</b>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"👤 <b>用户名：</b> <code>{username}</code>\n"
+            f"🔑 <b>初始密码：</b> <code>{password}</code>\n"
+            f"⏳ <b>有效时长：</b> <b>{days}</b> 天\n"
+            f"🆔 <b>绑定 TG：</b> <code>{target_tg_id or '未绑定'}</code>\n"
+            f"🌐 <b>服务器地址：</b> <code>{public_url}</code>\n"
+            f"━━━━━━━━━━━━━━━━━━━━\n"
+            f"💡 <i>建议登录后使用 <code>/resetpw</code> 或在客户端修改个人密码。</i>"
+        )
+        await update.message.reply_text(reply_card, parse_mode="HTML")
+
+        # Try to send a private DM to the target user
+        if target_tg_id and target_tg_id > 0:
+            dm_text = (
+                f"🎉 <b>你好！管理员已为你开通 Emby 观影账号！</b>\n\n"
+                f"👤 <b>登录账号：</b> <code>{username}</code>\n"
+                f"🔑 <b>登录密码：</b> <code>{password}</code>\n"
+                f"⏳ <b>有效期：</b> <b>{days}</b> 天\n"
+                f"🌐 <b>服务器地址：</b> <code>{public_url}</code>\n\n"
+                f"📱 <b>快速开始：</b>\n"
+                f"1. 下载 Infuse / Fileball / VidHub 或 Emby 官方客户端\n"
+                f"2. 输入上方服务器地址、账号和密码即可畅快观影！\n"
+                f"3. 每日在 Bot 发送 <code>/checkin</code> 即可免费领时长~"
+            )
+            await self.send_notification(target_tg_id, dm_text)
+
+    # --- ADMIN: DELETE USER (REPLY OR EXPLICIT) ---
+    async def cmd_deluser(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
+        """Admin command to delete account by replying or specifying identifier"""
+        if not self._is_admin(update.effective_user.id):
+            return
+
+        reply_msg = update.message.reply_to_message
+        args = context.args
+        u_db = None
+
+        if reply_msg and reply_msg.from_user:
+            target_tg_id = reply_msg.from_user.id
+            u_db = await self.db.get_user_by_tg(target_tg_id)
+        elif args:
+            u_db = await self.db.get_user_by_identifier(args[0].strip())
+        else:
+            await update.message.reply_text("💡 格式：回复用户消息发送 <code>/deluser</code>，或 <code>/deluser &lt;用户名/TG_ID&gt;</code>", parse_mode="HTML")
+            return
+
+        if not u_db:
+            await update.message.reply_text("❌ 未找到该用户的档案信息！")
+            return
+
+        emby_uid = u_db.get("emby_user_id")
+        username = u_db.get("emby_username")
+        tg_id = u_db.get("tg_id")
+
+        if emby_uid:
+            await self.emby.delete_user(emby_uid)
+        await self.db.delete_user_record(tg_id)
+        await self.db.log_action(update.effective_user.id, "ADMIN_DELETE", f"Deleted {username} (TG: {tg_id})")
+
+        await update.message.reply_text(f"🗑️ 已成功删除用户 <code>{username}</code> (TG: <code>{tg_id}</code>) 的 Emby 账号及全部数据！", parse_mode="HTML")
 
     async def cmd_checkin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         user_id = update.effective_user.id
@@ -455,8 +691,10 @@ class LemonEmbyBot:
                 f"👥 <b>总用户：</b> {len(users)} 人\n"
                 f"🎬 <b>在线播放数：</b> {len(sessions)} 个\n"
                 f"💡 快捷指令：\n"
+                f"• 回复某人消息发送 <code>/create 30</code> 一键开号\n"
+                f"• 回复某人消息发送 <code>/info</code> 一键查号\n"
+                f"• 回复某人消息发送 <code>/deluser</code> 一键销号\n"
                 f"• <code>/gen 30 5</code> 生成 5 张 30 天卡密\n"
-                f"• <code>/status</code> 查看详细播放会话\n"
-                f"• <code>/users</code> 浏览用户列表"
+                f"• <code>/status</code> 查看详细播放会话"
             )
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
