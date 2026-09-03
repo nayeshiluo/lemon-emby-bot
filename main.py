@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+from typing import Any
 import yaml
 import uvicorn
 from core.database import Database
@@ -67,12 +68,13 @@ async def main():
     logger.info(f"🍋 Lemon Emby Manager is running! Web Panel on http://{host}:{port}")
 
     # Run tasks concurrently
-    tasks = [asyncio.create_task(server.serve())]
+    tasks: list[asyncio.Task[Any]] = [asyncio.create_task(server.serve())]
     if bot:
         # Start TG Bot polling
         await bot.app.initialize()
         await bot.app.start()
-        tasks.append(asyncio.create_task(bot.app.updater.start_polling()))
+        if bot.app.updater:
+            tasks.append(asyncio.create_task(bot.app.updater.start_polling()))
 
     try:
         await asyncio.gather(*tasks)
@@ -80,7 +82,8 @@ async def main():
         logger.info("Shutting down Lemon Emby...")
         await scheduler.stop()
         if bot:
-            await bot.app.updater.stop()
+            if bot.app.updater:
+                await bot.app.updater.stop()
             await bot.app.stop()
             await bot.app.shutdown()
 
