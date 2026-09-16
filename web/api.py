@@ -38,7 +38,10 @@ def create_app(config: dict, db, emby_client):
     secret_key = config.get("server", {}).get("secret_key", "")
     
     if not secret_key or secret_key == "lemon-emby-admin-secret-key-change-me":
-        logger.critical("⚠️ SECURITY WARNING: Admin secret_key is using the default placeholder! Please change it in config.yaml.")
+        raise RuntimeError(
+            "Refusing to start admin API with an empty/default server.secret_key; "
+            "set a strong unique secret in config.yaml"
+        )
 
     async def verify_auth(request: Request, x_admin_token: Optional[str] = Header(None)):
         client_ip = request.client.host if request.client else "unknown"

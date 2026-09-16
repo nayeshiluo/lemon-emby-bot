@@ -180,7 +180,7 @@
     const { createApp, ref, onMounted } = Vue
     createApp({
       setup() {
-        const token = ref(localStorage.getItem('lemon_token') || 'lemon-emby-admin-secret-key-change-me')
+        const token = ref(sessionStorage.getItem('lemon_token') || '')
         const stats = ref({})
         const users = ref([])
         const genForm = ref({ value: 30, count: 5, card_type: 'days' })
@@ -192,7 +192,7 @@
         })
 
         const fetchData = async () => {
-          localStorage.setItem('lemon_token', token.value)
+          sessionStorage.setItem('lemon_token', token.value)
           try {
             const resStats = await fetch('/api/stats', { headers: getHeaders() })
             if (resStats.ok) stats.value = await resStats.json()

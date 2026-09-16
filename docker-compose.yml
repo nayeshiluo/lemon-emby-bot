@@ -6,7 +6,7 @@ services:
     container_name: lemon-emby-bot
     restart: unless-stopped
     ports:
-      - "8888:8888"
+      - "127.0.0.1:8888:8888"
     volumes:
       - ./config.yaml:/app/config.yaml
       - ./lemon_emby.db:/app/lemon_emby.db
