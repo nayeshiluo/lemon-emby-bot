@@ -45,6 +45,10 @@ class LemonEmbyBot:
         self.user_cooldowns[user_id] = now
         return False
 
+    @staticmethod
+    def _is_private_chat(update: Update) -> bool:
+        return bool(update.effective_chat and update.effective_chat.type == "private")
+
     def _clean_expired_duels(self):
         """Clean up pending duels older than 120 seconds"""
         now = datetime.datetime.now()
@@ -674,7 +678,13 @@ class LemonEmbyBot:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💡 <i>建议登录后使用 <code>/resetpw</code> 自助修改个人密码。</i>"
         )
-        await update.message.reply_text(reply_card, parse_mode="HTML")
+        if self._is_private_chat(update):
+            await update.message.reply_text(reply_card, parse_mode="HTML")
+        else:
+            await update.message.reply_text(
+                "✅ Emby 账号已开通。登录凭据已通过私聊发送，请勿在群内索取或发布密码。",
+                parse_mode="HTML",
+            )
 
         if target_tg_id and target_tg_id > 0:
             dm_text = (
@@ -746,6 +756,9 @@ class LemonEmbyBot:
     async def cmd_bind(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
+        if not self._is_private_chat(update):
+            await update.message.reply_text("🔒 为保护账号安全，请在与 Bot 的私聊中使用 /bind；群聊不会处理账号凭据。")
+            return
         args = context.args
         if not args or len(args) < 2:
             await update.message.reply_text("💡 使用格式：<code>/bind &lt;用户名&gt; &lt;密码&gt;</code>", parse_mode="HTML")
@@ -762,8 +775,20 @@ class LemonEmbyBot:
         emby_u = await self.emby.get_user_by_name(username)
         if emby_u:
             emby_user_id = emby_u["Id"]
-            await self.emby.update_user_password(emby_user_id, password)
-            await self.emby.set_user_disabled(emby_user_id, False)
+            linked = await self.db.get_user_by_emby_id(emby_user_id)
+            if not linked:
+                logger.warning("Refusing bind for existing unlinked Emby user %s", emby_user_id)
+                await update.message.reply_text("❌ 该 Emby 账号已存在，但无法验证归属；请联系管理员处理。")
+                return
+            if linked["tg_id"] != user_id:
+                logger.warning("Refusing bind for Emby user %s linked to another Telegram user", emby_user_id)
+                await update.message.reply_text("❌ 该 Emby 账号已与其他用户绑定，无法认领。")
+                return
+            await update.message.reply_text(
+                f"✅ 你已绑定账号：<code>{html.escape(linked['emby_username'])}</code>。未重置密码。",
+                parse_mode="HTML",
+            )
+            return
         else:
             new_u = await self.emby.create_user(username, password)
             if not new_u:
@@ -823,7 +848,7 @@ class LemonEmbyBot:
         
         success = await self.emby.update_user_password(u["emby_user_id"], new_pw)
         if success:
-            await update.message.reply_text(f"✅ 密码修改成功！新密码已生效：<code>{html.escape(new_pw)}</code>", parse_mode="HTML")
+            await update.message.reply_text("✅ 密码修改成功！新密码已生效。")
         else:
             await update.message.reply_text("❌ 密码同步到 Emby 失败，请稍后重试。")
 

@@ -60,8 +60,11 @@ class BackgroundScheduler:
             if expiry < now:
                 if not is_disabled and auto_disable:
                     logger.warning(f"User {u['emby_username']} (TG: {tg_id}) expired. Disabling on Emby...")
-                    if emby_user_id:
-                        await self.emby.set_user_disabled(emby_user_id, True)
+                    disabled = bool(emby_user_id) and await self.emby.set_user_disabled(emby_user_id, True)
+                    if not disabled:
+                        logger.error("Failed to disable expired Emby user %s (TG: %s); retaining retryable local state", emby_user_id, tg_id)
+                        await self.db.log_action(tg_id, "AUTO_EXPIRE_FAILED", "Emby disable request failed")
+                        continue
                     await self.db.update_user_status(tg_id, True)
                     await self.db.log_action(tg_id, "AUTO_EXPIRE", f"Account disabled at {expiry_str}")
                     

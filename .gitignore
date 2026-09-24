@@ -6,3 +6,8 @@ config.yaml
 lemon_emby.db
 *.log
 .DS_Store
+*.db-*
+*.sqlite*
+*.bak
+backups/
+runtime/
