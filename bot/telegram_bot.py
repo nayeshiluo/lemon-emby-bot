@@ -891,7 +891,7 @@ class LemonEmbyBot:
             msg = "🎉 兑换成功！"
 
         if activation_failed:
-            msg += "\n\n⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。"
+            msg += "\n\n⚠️ 时长已到账，但账号仍处于禁用状态，请联系管理员处理。"
         
         await update.message.reply_text(msg, parse_mode="HTML")
 
@@ -1054,7 +1054,7 @@ class LemonEmbyBot:
         new_exp = await self.db.extend_user_expiry(u_db["tg_id"], days)
         activated = await self._reactivate_if_disabled(u_db["tg_id"])
         name_safe = html.escape(username)
-        activation_status = "" if activated else "\n⚠️ 时长已增加，但 Emby 自动解封失败，请检查服务器状态。"
+        activation_status = "" if activated else "\n⚠️ 时长已增加，但账号仍处于禁用状态，请联系管理员处理。"
         await update.message.reply_text(f"✅ 已为 <code>{name_safe}</code> 增加 {days} 天时长！\n新到期时间：<code>{new_exp.strftime('%Y-%m-%d %H:%M')}</code>{activation_status}", parse_mode="HTML")
 
     # --- CALLBACK HANDLER ---
@@ -1156,7 +1156,7 @@ class LemonEmbyBot:
             if res.get("success"):
                 text = f"🎉 <b>签到成功！</b>\n\n获得时长: +{res['reward_days']} 天\n获得积分: +{res['points']} PTS\n新到期: <code>{res['new_expiry']}</code>"
                 if reward_days > 0 and not await self._reactivate_if_disabled(user_id):
-                    text += "\n\n⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。"
+                    text += "\n\n⚠️ 时长已到账，但账号仍处于禁用状态，请联系管理员处理。"
             else:
                 text = f"⚠️ {res.get('msg')}"
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
@@ -1189,7 +1189,7 @@ class LemonEmbyBot:
                     f"✨ {res['details']}"
                 )
                 if activation_failed:
-                    text += "\n\n⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。"
+                    text += "\n\n⚠️ 时长已到账，但账号仍处于禁用状态，请联系管理员处理。"
             else:
                 text = f"⚠️ 兑换失败：{res.get('msg')}"
             await query.edit_message_text(text, reply_markup=self._get_shop_keyboard(), parse_mode="HTML")
@@ -1206,7 +1206,7 @@ class LemonEmbyBot:
                     f"━━━━━━━━━━━━━━━━━━━━"
                 )
                 if activation_failed:
-                    text += "\n\n⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。"
+                    text += "\n\n⚠️ 时长已到账，但账号仍处于禁用状态，请联系管理员处理。"
             else:
                 text = f"⚠️ {res.get('msg')}"
             
