@@ -36,10 +36,17 @@ class Database:
                 points INTEGER DEFAULT 0,
                 max_devices INTEGER DEFAULT 2,
                 is_disabled INTEGER DEFAULT 0,
+                disabled_reason TEXT,
                 last_checkin TEXT,
                 created_at TEXT
             );
             """)
+            async with db.execute("PRAGMA table_info(users)") as cursor:
+                user_columns = {row[1] for row in await cursor.fetchall()}
+            if "disabled_reason" not in user_columns:
+                # Existing disabled users remain unknown until an admin reviews them;
+                # never infer that a prior manual ban was only an expiry suspension.
+                await db.execute("ALTER TABLE users ADD COLUMN disabled_reason TEXT")
             await db.execute("""
             CREATE TABLE IF NOT EXISTS codes (
                 code TEXT PRIMARY KEY,
@@ -150,9 +157,18 @@ class Database:
             await db.commit()
             return cursor.rowcount > 0
 
-    async def update_user_status(self, tg_id: int, is_disabled: bool):
+    async def update_user_status(self, tg_id: int, is_disabled: bool, reason: Optional[str] = None):
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE users SET is_disabled = ? WHERE tg_id = ?", (1 if is_disabled else 0, tg_id))
+            if is_disabled:
+                await db.execute(
+                    "UPDATE users SET is_disabled = 1, disabled_reason = ? WHERE tg_id = ?",
+                    (reason or "unknown", tg_id),
+                )
+            else:
+                await db.execute(
+                    "UPDATE users SET is_disabled = 0, disabled_reason = NULL WHERE tg_id = ?",
+                    (tg_id,),
+                )
             await db.commit()
 
     async def delete_user_record(self, tg_id: int):
