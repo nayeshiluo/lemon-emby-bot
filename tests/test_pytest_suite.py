@@ -11,6 +11,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 from bot.telegram_bot import LemonEmbyBot
 from core.database import Database
 from core.emby import EmbyClient
+from core.scheduler import BackgroundScheduler
 from web.api import create_app, FAILED_ATTEMPTS
 from starlette.testclient import TestClient
 
@@ -126,6 +127,53 @@ async def test_reactivation_updates_local_status_only_after_emby_success():
     assert await bot._reactivate_if_disabled(1005) is True
     assert bot.db.user["is_disabled"] == 0
     assert bot.db.status_updates == [(1005, False)]
+
+@pytest.mark.asyncio
+async def test_stop_session_reports_emby_failure():
+    client = EmbyClient("http://127.0.0.1:8096", "dummy")
+    endpoints = []
+
+    async def failed_request(method, endpoint, **kwargs):
+        endpoints.append(endpoint)
+        return None
+
+    client._request = failed_request
+    assert await client.stop_session("session-1") is False
+    assert endpoints[-1].endswith("/Playing/Stop")
+
+    async def successful_stop(method, endpoint, **kwargs):
+        return "" if endpoint.endswith("/Playing/Stop") else None
+
+    client._request = successful_stop
+    assert await client.stop_session("session-1") is True
+
+@pytest.mark.asyncio
+async def test_scheduler_does_not_claim_failed_session_was_stopped():
+    class FakeDb:
+        async def get_user_by_emby_id(self, emby_user_id):
+            return {"tg_id": 3001, "emby_username": "viewer", "max_devices": 1}
+
+    class FakeEmby:
+        async def get_active_sessions(self):
+            return [
+                {"UserId": "emby-1", "Id": "session-1", "NowPlayingItem": {"Name": "movie"}},
+                {"UserId": "emby-1", "Id": "session-2", "NowPlayingItem": {"Name": "movie"}},
+            ]
+
+        async def stop_session(self, session_id, message):
+            return False
+
+    notifications = []
+
+    async def notify(tg_id, message):
+        notifications.append((tg_id, message))
+
+    scheduler = BackgroundScheduler(
+        FakeDb(), FakeEmby(), {"emby": {"default_max_devices": 1}}, notify_func=notify
+    )
+    await scheduler.check_concurrency()
+
+    assert notifications == []
 
 @pytest.mark.asyncio
 async def test_password_commands_are_restricted_to_private_chats():

@@ -111,7 +111,10 @@ class BackgroundScheduler:
                     item_name = ex_s.get("NowPlayingItem", {}).get("Name", "媒体文件")
                     
                     logger.info(f"Killing excess session {sid} for {device_name} ({client_name})")
-                    await self.emby.stop_session(sid, f"超过最大同时播放限制（限制 {max_devs} 台）")
+                    stopped = await self.emby.stop_session(sid, f"超过最大同时播放限制（限制 {max_devs} 台）")
+                    if not stopped:
+                        logger.error("Failed to stop excess session %s for Emby user %s", sid, emby_user_id)
+                        continue
                     
                     if user_db and self.notify_func:
                         msg = (

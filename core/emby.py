@@ -121,5 +121,5 @@ class EmbyClient:
             "TimeoutMs": 3000
         })
         # Command to stop playback
-        await self._request("POST", f"/Sessions/{session_id}/Playing/Stop")
-        return True
+        stop_result = await self._request("POST", f"/Sessions/{session_id}/Playing/Stop")
+        return stop_result is not None
