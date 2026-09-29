@@ -4,6 +4,7 @@ import datetime
 import os
 import sys
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 # Add root directory to sys.path
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -93,18 +94,42 @@ async def test_concurrent_expiry_extensions_are_not_lost(test_db):
     assert (await test_db.get_user_by_tg(1004))["is_disabled"] == 1
 
 @pytest.mark.asyncio
+async def test_disabled_reason_migration_and_persistence(tmp_path):
+    import aiosqlite
+
+    db_path = str(tmp_path / "legacy.db")
+    async with aiosqlite.connect(db_path) as conn:
+        await conn.execute("""
+            CREATE TABLE users (
+                tg_id INTEGER PRIMARY KEY, emby_user_id TEXT, emby_username TEXT UNIQUE,
+                expiry_date TEXT, points INTEGER DEFAULT 0, max_devices INTEGER DEFAULT 2,
+                is_disabled INTEGER DEFAULT 0, last_checkin TEXT, created_at TEXT
+            )
+        """)
+        await conn.commit()
+
+    db = Database(db_path)
+    await db.init_db()
+    await db.create_user_record(1006, "emby_uid_1006", "testuser1006")
+    await db.update_user_status(1006, True, reason="admin")
+    assert (await db.get_user_by_tg(1006))["disabled_reason"] == "admin"
+    await db.update_user_status(1006, False)
+    assert (await db.get_user_by_tg(1006))["disabled_reason"] is None
+
+@pytest.mark.asyncio
 async def test_reactivation_updates_local_status_only_after_emby_success():
     class FakeDb:
         def __init__(self):
-            self.user = {"tg_id": 1005, "emby_user_id": "emby_uid_5", "is_disabled": 1}
+            self.user = {"tg_id": 1005, "emby_user_id": "emby_uid_5", "is_disabled": 1, "disabled_reason": "expired"}
             self.status_updates = []
 
         async def get_user_by_tg(self, tg_id):
             return self.user
 
-        async def update_user_status(self, tg_id, disabled):
+        async def update_user_status(self, tg_id, disabled, reason=None):
             self.status_updates.append((tg_id, disabled))
             self.user["is_disabled"] = int(disabled)
+            self.user["disabled_reason"] = reason if disabled else None
 
     class FakeEmby:
         def __init__(self, succeeds):
@@ -127,6 +152,38 @@ async def test_reactivation_updates_local_status_only_after_emby_success():
     assert await bot._reactivate_if_disabled(1005) is True
     assert bot.db.user["is_disabled"] == 0
     assert bot.db.status_updates == [(1005, False)]
+
+@pytest.mark.asyncio
+async def test_renewal_does_not_override_admin_or_legacy_disabled_status():
+    class FakeDb:
+        def __init__(self, reason):
+            self.user = {"tg_id": 1007, "emby_user_id": "emby_uid_7", "is_disabled": 1, "disabled_reason": reason}
+            self.status_updates = []
+
+        async def get_user_by_tg(self, tg_id):
+            return self.user
+
+        async def update_user_status(self, tg_id, disabled, reason=None):
+            self.status_updates.append((tg_id, disabled, reason))
+
+    class FakeEmby:
+        def __init__(self):
+            self.calls = []
+
+        async def set_user_disabled(self, emby_user_id, disabled):
+            self.calls.append((emby_user_id, disabled))
+            return True
+
+    for reason in ("admin", None):
+        db = FakeDb(reason)
+        emby = FakeEmby()
+        bot = object.__new__(LemonEmbyBot)
+        bot.db, bot.emby = db, emby
+
+        assert await bot._reactivate_if_disabled(1007) is False
+        assert db.user["is_disabled"] == 1
+        assert db.status_updates == []
+        assert emby.calls == []
 
 @pytest.mark.asyncio
 async def test_stop_session_reports_emby_failure():
@@ -202,6 +259,35 @@ async def test_password_commands_are_restricted_to_private_chats():
 
     assert len(msg.replies) == 2
     assert all("私聊" in reply for reply in msg.replies)
+
+@pytest.mark.asyncio
+async def test_successful_transfer_command_replies_without_renewal_state():
+    class FakeMessage:
+        reply_to_message = None
+
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    bot = object.__new__(LemonEmbyBot)
+    bot.db = SimpleNamespace(
+        get_user_by_username=AsyncMock(),
+        transfer_points=AsyncMock(return_value={
+            "success": True, "amount": 10, "from_remaining": 20, "to_username": "recipient"
+        }),
+    )
+    msg = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=201),
+        message=msg,
+    )
+
+    await bot.cmd_transfer(update, SimpleNamespace(args=["202", "10"]))
+
+    assert bot.db.transfer_points.await_count == 1
+    assert "积分转账成功" in msg.replies[0]
 
 @pytest.mark.asyncio
 async def test_atomic_double_spend_prevention(test_db):
