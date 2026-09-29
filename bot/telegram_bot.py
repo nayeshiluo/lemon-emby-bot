@@ -49,6 +49,24 @@ class LemonEmbyBot:
     def _is_private_chat(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.type == "private")
 
+    async def _reactivate_if_disabled(self, tg_id: int, force: bool = False) -> bool:
+        """Synchronize a renewed account's local state with Emby access."""
+        user = await self.db.get_user_by_tg(tg_id)
+        if not user or not user.get("emby_user_id"):
+            return False
+        if not force and not user.get("is_disabled"):
+            return True
+        try:
+            enabled = await self.emby.set_user_disabled(user["emby_user_id"], False)
+        except Exception:
+            logger.exception("Failed to re-enable Emby user %s after renewal", user["emby_user_id"])
+            return False
+        if enabled:
+            await self.db.update_user_status(tg_id, False)
+        else:
+            logger.error("Emby refused to re-enable user %s after renewal", user["emby_user_id"])
+        return enabled
+
     def _clean_expired_duels(self):
         """Clean up pending duels older than 120 seconds"""
         now = datetime.datetime.now()
@@ -385,6 +403,8 @@ class LemonEmbyBot:
         if not res.get("success"):
             await update.message.reply_text(f"⚠️ {res.get('msg')}")
             return
+
+        activation_failed = res.get("type") == "days" and not await self._reactivate_if_disabled(user_id)
         
         text = (
             f"🎰 <b>Lemon 积分幸运大转盘</b>\n"
@@ -392,6 +412,7 @@ class LemonEmbyBot:
             f"🎯 <b>抽奖结果：</b>\n"
             f"{res['msg']}\n\n"
             f"💎 <b>剩余积分：</b> <code>{res['remaining_points']}</code> PTS\n"
+            f"{'⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。\n' if activation_failed else ''}"
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"<i>单次抽奖消耗 20 积分，祝您下次欧气满满！</i>"
         )
@@ -594,6 +615,11 @@ class LemonEmbyBot:
 
         reply_msg = update.message.reply_to_message
         args = context.args
+        if not self._is_private_chat(update) and len(args) > 1:
+            await update.message.reply_text(
+                "🔒 群聊开号请省略密码参数，Bot 会私聊发送随机密码；如需指定密码，请在私聊中执行。"
+            )
+            return
         target_tg_id = None
         username = None
         password = None
@@ -637,6 +663,15 @@ class LemonEmbyBot:
         if not username:
             username = f"user_{secrets.randbelow(100000)}"
 
+        managed_user = await self.db.get_user_by_username(username)
+        if managed_user:
+            await update.message.reply_text(
+                f"⚠️ Emby 用户 <code>{html.escape(managed_user['emby_username'])}</code> 已在系统中绑定，未修改密码或用户数据。\n"
+                f"如需续期请使用 <code>/addtime {html.escape(managed_user['emby_username'])} {days}</code>。",
+                parse_mode="HTML",
+            )
+            return
+
         if target_tg_id:
             existing = await self.db.get_user_by_tg(target_tg_id)
             if existing:
@@ -648,8 +683,16 @@ class LemonEmbyBot:
                 return
 
         emby_u = await self.emby.get_user_by_name(username)
+        created_new_emby_user = False
         if emby_u:
             emby_user_id = emby_u["Id"]
+            managed_user = await self.db.get_user_by_emby_id(emby_user_id)
+            if managed_user:
+                await update.message.reply_text(
+                    f"⚠️ 该 Emby 账号已绑定到 <code>{html.escape(managed_user['emby_username'])}</code>，未修改密码。",
+                    parse_mode="HTML",
+                )
+                return
             await self.emby.update_user_password(emby_user_id, password)
             await self.emby.set_user_disabled(emby_user_id, False)
         else:
@@ -658,9 +701,14 @@ class LemonEmbyBot:
                 await update.message.reply_text("❌ Emby 服务器开号失败，请检查服务器连接或 API Key！")
                 return
             emby_user_id = new_u["Id"]
+            created_new_emby_user = True
 
         tg_id_to_save = target_tg_id or int(f"99{secrets.randbelow(1000000)}")
-        await self.db.create_user_record(tg_id_to_save, emby_user_id, username, days=days)
+        if not await self.db.create_user_record(tg_id_to_save, emby_user_id, username, days=days):
+            if created_new_emby_user:
+                await self.emby.delete_user(emby_user_id)
+            await update.message.reply_text("❌ 用户记录已被并发请求占用，未覆盖现有绑定；请重新检查后再试。")
+            return
         await self.db.log_action(update.effective_user.id, "ADMIN_CREATE", f"Created {username} for TG:{target_tg_id} days:{days}")
 
         public_url = html.escape(self.config.get("emby", {}).get("public_url", "https://emby.example.com"))
@@ -744,11 +792,14 @@ class LemonEmbyBot:
             await update.message.reply_text(f"⚠️ {res.get('msg')}")
             return
 
+        activation_failed = reward_days > 0 and not await self._reactivate_if_disabled(user_id)
+
         text = (
             f"🎉 <b>签到成功！</b>\n\n"
             f"🎁 获得时长：<b>+{res['reward_days']}</b> 天\n"
             f"💎 获得积分：<b>+{res['points']}</b> PTS (当前总积分: {res['total_points']})\n"
             f"⏳ 最新到期时间：<code>{res['new_expiry']}</code>\n\n"
+            f"{'⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。\n' if activation_failed else ''}"
             f"<i>感谢陪伴，记得明天再来哦~</i>"
         )
         await update.message.reply_text(text, parse_mode="HTML")
@@ -796,7 +847,10 @@ class LemonEmbyBot:
                 return
             emby_user_id = new_u["Id"]
 
-        await self.db.create_user_record(user_id, emby_user_id, username, days=30)
+        if not await self.db.create_user_record(user_id, emby_user_id, username, days=30):
+            await self.emby.delete_user(emby_user_id)
+            await update.message.reply_text("❌ 账号绑定发生并发冲突，未覆盖现有绑定；请重新确认账号状态后再试。")
+            return
         await self.db.log_action(user_id, "BIND_USER", f"Username: {username}")
 
         text = (
@@ -823,18 +877,26 @@ class LemonEmbyBot:
             await update.message.reply_text(f"❌ {res.get('msg')}")
             return
 
+        activation_failed = res.get("type") == "days" and not await self._reactivate_if_disabled(user_id)
+
         if res.get("type") == "days":
             msg = f"🎉 <b>兑换成功！</b>\n\n延长时长：<b>+{res['value']}</b> 天\n新到期时间：<code>{res['new_expiry']}</code>"
         elif res.get("type") == "points":
             msg = f"🎉 <b>兑换成功！</b>\n\n增加积分：<b>+{res['value']}</b> PTS\n当前积分：<code>{res['total_points']}</code>"
         else:
             msg = "🎉 兑换成功！"
+
+        if activation_failed:
+            msg += "\n\n⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。"
         
         await update.message.reply_text(msg, parse_mode="HTML")
 
     async def cmd_resetpw(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
+        if not self._is_private_chat(update):
+            await update.message.reply_text("🔒 为保护密码安全，请在与 Bot 的私聊中使用 /resetpw。")
+            return
         args = context.args
         if not args:
             await update.message.reply_text("💡 使用格式：<code>/resetpw &lt;新密码&gt;</code>", parse_mode="HTML")
@@ -986,9 +1048,10 @@ class LemonEmbyBot:
             return
         
         new_exp = await self.db.extend_user_expiry(u_db["tg_id"], days)
-        await self.emby.set_user_disabled(emby_u["Id"], False)
+        activated = await self._reactivate_if_disabled(u_db["tg_id"], force=True)
         name_safe = html.escape(username)
-        await update.message.reply_text(f"✅ 已为 <code>{name_safe}</code> 增加 {days} 天时长！\n新到期时间：<code>{new_exp.strftime('%Y-%m-%d %H:%M')}</code>", parse_mode="HTML")
+        activation_status = "" if activated else "\n⚠️ 时长已增加，但 Emby 自动解封失败，请检查服务器状态。"
+        await update.message.reply_text(f"✅ 已为 <code>{name_safe}</code> 增加 {days} 天时长！\n新到期时间：<code>{new_exp.strftime('%Y-%m-%d %H:%M')}</code>{activation_status}", parse_mode="HTML")
 
     # --- CALLBACK HANDLER ---
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -1088,6 +1151,8 @@ class LemonEmbyBot:
             res = await self.db.user_checkin(user_id, reward_days, points)
             if res.get("success"):
                 text = f"🎉 <b>签到成功！</b>\n\n获得时长: +{res['reward_days']} 天\n获得积分: +{res['points']} PTS\n新到期: <code>{res['new_expiry']}</code>"
+                if reward_days > 0 and not await self._reactivate_if_disabled(user_id):
+                    text += "\n\n⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。"
             else:
                 text = f"⚠️ {res.get('msg')}"
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
@@ -1111,6 +1176,7 @@ class LemonEmbyBot:
             item_key = data.replace("cb_buy_", "")
             res = await self.db.exchange_item(user_id, item_key)
             if res.get("success"):
+                activation_failed = item_key.startswith("days_") and not await self._reactivate_if_disabled(user_id)
                 text = (
                     f"🎉 <b>兑换成功！</b>\n\n"
                     f"📦 商品：<b>{html.escape(res['item_name'])}</b>\n"
@@ -1118,6 +1184,8 @@ class LemonEmbyBot:
                     f"💎 剩余积分：<code>{res['remaining_points']}</code> PTS\n"
                     f"✨ {res['details']}"
                 )
+                if activation_failed:
+                    text += "\n\n⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。"
             else:
                 text = f"⚠️ 兑换失败：{res.get('msg')}"
             await query.edit_message_text(text, reply_markup=self._get_shop_keyboard(), parse_mode="HTML")
@@ -1125,6 +1193,7 @@ class LemonEmbyBot:
         elif data == "cb_lottery":
             res = await self.db.lottery_draw(user_id, cost=20)
             if res.get("success"):
+                activation_failed = res.get("type") == "days" and not await self._reactivate_if_disabled(user_id)
                 text = (
                     f"🎰 <b>幸运大转盘抽奖结果</b>\n"
                     f"━━━━━━━━━━━━━━━━━━━━\n"
@@ -1132,6 +1201,8 @@ class LemonEmbyBot:
                     f"💎 剩余积分：<code>{res['remaining_points']}</code> PTS\n"
                     f"━━━━━━━━━━━━━━━━━━━━"
                 )
+                if activation_failed:
+                    text += "\n\n⚠️ 时长已到账，但 Emby 自动解封失败，请联系管理员。"
             else:
                 text = f"⚠️ {res.get('msg')}"
             

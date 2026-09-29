@@ -13,6 +13,16 @@ class Database:
     def __init__(self, db_path: str = "lemon_emby.db"):
         self.db_path = db_path
 
+    @staticmethod
+    def _as_utc(value: Optional[str]) -> Optional[datetime.datetime]:
+        """Parse stored timestamps consistently, including legacy naive values."""
+        if not value:
+            return None
+        parsed = datetime.datetime.fromisoformat(value)
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=datetime.timezone.utc)
+        return parsed.astimezone(datetime.timezone.utc)
+
     async def init_db(self):
         """Initialize database schema with WAL mode for concurrency"""
         async with aiosqlite.connect(self.db_path) as db:
@@ -88,29 +98,35 @@ class Database:
                 rows = await cursor.fetchall()
                 return [dict(r) for r in rows]
 
-    async def create_user_record(self, tg_id: int, emby_user_id: str, emby_username: str, days: int = 30, max_devices: int = 2):
+    async def create_user_record(self, tg_id: int, emby_user_id: str, emby_username: str, days: int = 30, max_devices: int = 2) -> bool:
         now = datetime.datetime.now(datetime.timezone.utc)
         expiry = now + datetime.timedelta(days=days)
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("""
-            INSERT OR REPLACE INTO users (tg_id, emby_user_id, emby_username, expiry_date, points, max_devices, is_disabled, created_at)
+            cursor = await db.execute("""
+            INSERT INTO users (tg_id, emby_user_id, emby_username, expiry_date, points, max_devices, is_disabled, created_at)
             VALUES (?, ?, ?, ?, 0, ?, 0, ?)
+            ON CONFLICT DO NOTHING
             """, (tg_id, emby_user_id, emby_username, expiry.isoformat(), max_devices, now.isoformat()))
             await db.commit()
+            return cursor.rowcount == 1
 
     async def extend_user_expiry(self, tg_id: int, days: int) -> Optional[datetime.datetime]:
-        user = await self.get_user_by_tg(tg_id)
-        if not user:
-            return None
-        
         now = datetime.datetime.now(datetime.timezone.utc)
-        current_expiry = datetime.datetime.fromisoformat(user["expiry_date"]) if user.get("expiry_date") else now
-        if current_expiry < now:
-            current_expiry = now
-        
-        new_expiry = current_expiry + datetime.timedelta(days=days)
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE users SET expiry_date = ?, is_disabled = 0 WHERE tg_id = ?", (new_expiry.isoformat(), tg_id))
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT expiry_date FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return None
+
+            current_expiry = self._as_utc(user["expiry_date"]) or now
+            new_expiry = max(current_expiry, now) + datetime.timedelta(days=days)
+            await db.execute(
+                "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
+                (new_expiry.isoformat(), tg_id),
+            )
             await db.commit()
         return new_expiry
 
@@ -145,24 +161,30 @@ class Database:
             await db.commit()
 
     async def user_checkin(self, tg_id: int, reward_days: int = 1, points: int = 10) -> Dict[str, Any]:
-        user = await self.get_user_by_tg(tg_id)
-        if not user:
-            return {"success": False, "msg": "未绑定 Emby 账号"}
-        
         now = datetime.datetime.now(datetime.timezone.utc)
-        last_checkin = user.get("last_checkin")
-        if last_checkin:
-            last_date = datetime.datetime.fromisoformat(last_checkin).date()
-            if last_date == now.date():
-                return {"success": False, "msg": "今天已经签过到啦，明天再来吧！"}
-        
-        new_expiry = await self.extend_user_expiry(tg_id, reward_days) if reward_days > 0 else datetime.datetime.fromisoformat(user["expiry_date"])
-        new_points = user.get("points", 0) + points
-        
         async with aiosqlite.connect(self.db_path) as db:
-            await db.execute("UPDATE users SET last_checkin = ?, points = ? WHERE tg_id = ?", (now.isoformat(), new_points, tg_id))
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return {"success": False, "msg": "未绑定 Emby 账号"}
+
+            last_checkin = self._as_utc(user["last_checkin"])
+            if last_checkin and last_checkin.date() == now.date():
+                await db.rollback()
+                return {"success": False, "msg": "今天已经签过到啦，明天再来吧！"}
+
+            current_expiry = self._as_utc(user["expiry_date"]) or now
+            new_expiry = max(current_expiry, now) + datetime.timedelta(days=reward_days) if reward_days > 0 else current_expiry
+            await db.execute(
+                "UPDATE users SET last_checkin = ?, points = points + ?, expiry_date = ? WHERE tg_id = ?",
+                (now.isoformat(), points, new_expiry.isoformat(), tg_id),
+            )
+            new_points = user["points"] + points
             await db.commit()
-        
+
         return {
             "success": True,
             "reward_days": reward_days,
@@ -172,7 +194,7 @@ class Database:
         }
 
     async def exchange_item(self, tg_id: int, item_key: str) -> Dict[str, Any]:
-        """Points Shop Exchange with Atomic deduction"""
+        """Exchange points and deliver the item in one transaction."""
         shop_items = {
             "days_7": {"name": "7天观影时长", "cost": 50, "type": "days", "val": 7},
             "days_30": {"name": "30天观影时长", "cost": 180, "type": "days", "val": 30},
@@ -183,77 +205,92 @@ class Database:
         if not item:
             return {"success": False, "msg": "无效的商品"}
 
-        user = await self.get_user_by_tg(tg_id)
-        if not user:
-            return {"success": False, "msg": "未绑定 Emby 账号"}
-
         cost = item["cost"]
-        # Atomic deduction
-        deducted = await self.deduct_user_points_atomic(tg_id, cost)
-        if not deducted:
-            cur_pts = user.get("points", 0)
-            return {"success": False, "msg": f"积分不足！需要 {cost} 积分，您当前仅有 {cur_pts} 积分。"}
+        now = datetime.datetime.now(datetime.timezone.utc)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return {"success": False, "msg": "未绑定 Emby 账号"}
 
-        # Deliver item
-        if item["type"] == "days":
-            new_exp = await self.extend_user_expiry(tg_id, item["val"])
-            updated_u = await self.get_user_by_tg(tg_id)
-            return {
-                "success": True,
-                "item_name": item["name"],
-                "cost": cost,
-                "remaining_points": updated_u.get("points", 0),
-                "details": f"到期时间已延长至: {new_exp.strftime('%Y-%m-%d %H:%M')}"
-            }
-        elif item["type"] == "dev":
-            new_devs = user.get("max_devices", 2) + item["val"]
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("UPDATE users SET max_devices = ? WHERE tg_id = ?", (new_devs, tg_id))
-                await db.commit()
-            updated_u = await self.get_user_by_tg(tg_id)
-            return {
-                "success": True,
-                "item_name": item["name"],
-                "cost": cost,
-                "remaining_points": updated_u.get("points", 0),
-                "details": f"允许最大并发设备数已提升至: {new_devs} 台"
-            }
+            if user["points"] < cost:
+                await db.rollback()
+                return {"success": False, "msg": f"积分不足！需要 {cost} 积分，您当前仅有 {user['points']} 积分。"}
 
-        return {"success": False, "msg": "未知商品类型"}
+            await db.execute("UPDATE users SET points = points - ? WHERE tg_id = ?", (cost, tg_id))
+            if item["type"] == "days":
+                current_expiry = self._as_utc(user["expiry_date"]) or now
+                new_expiry = max(current_expiry, now) + datetime.timedelta(days=item["val"])
+                await db.execute(
+                    "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
+                    (new_expiry.isoformat(), tg_id),
+                )
+                details = f"到期时间已延长至: {new_expiry.strftime('%Y-%m-%d %H:%M')}"
+            else:
+                await db.execute("UPDATE users SET max_devices = max_devices + ? WHERE tg_id = ?", (item["val"], tg_id))
+                async with db.execute("SELECT max_devices FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                    updated = await cursor.fetchone()
+                details = f"允许最大并发设备数已提升至: {updated['max_devices']} 台"
+
+            async with db.execute("SELECT points FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                updated_points = await cursor.fetchone()
+            await db.commit()
+
+        return {
+            "success": True,
+            "item_name": item["name"],
+            "cost": cost,
+            "remaining_points": updated_points["points"],
+            "details": details,
+        }
 
     async def lottery_draw(self, tg_id: int, cost: int = 20) -> Dict[str, Any]:
-        """Lottery Draw with Atomic deduction"""
-        user = await self.get_user_by_tg(tg_id)
-        if not user:
-            return {"success": False, "msg": "未绑定 Emby 账号"}
-        
-        deducted = await self.deduct_user_points_atomic(tg_id, cost)
-        if not deducted:
-            return {"success": False, "msg": f"抽奖需要 {cost} 积分，您当前积分不足！"}
+        """Charge the draw and apply its prize as one transaction."""
+        if cost <= 0:
+            return {"success": False, "msg": "抽奖积分必须大于 0"}
 
-        roll = random.random() * 100
-        prize = {}
-        
-        if roll < 5:
-            new_devs = user.get("max_devices", 2) + 1
-            async with aiosqlite.connect(self.db_path) as db:
-                await db.execute("UPDATE users SET max_devices = ? WHERE tg_id = ?", (new_devs, tg_id))
-                await db.commit()
-            prize = {"type": "grand", "msg": f"🎉 欧皇降临！抽中【并发设备 +1 台】（当前上限: {new_devs} 台）"}
-        elif roll < 20:
-            new_exp = await self.extend_user_expiry(tg_id, 7)
-            prize = {"type": "days", "msg": f"🎁 大吉！抽中【7天观影时长】（新到期: {new_exp.strftime('%Y-%m-%d')}）"}
-        elif roll < 45:
-            new_exp = await self.extend_user_expiry(tg_id, 3)
-            prize = {"type": "days", "msg": f"✨ 中奖！抽中【3天观影时长】（新到期: {new_exp.strftime('%Y-%m-%d')}）"}
-        elif roll < 75:
-            await self.add_user_points(tg_id, 35)
-            prize = {"type": "points", "msg": "💰 积分红包！抽中【35 积分】（净赚 15 积分）"}
-        else:
-            prize = {"type": "none", "msg": "☕ 差点就中了！获得了【赛博安慰奖：功德 +1】"}
+        now = datetime.datetime.now(datetime.timezone.utc)
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return {"success": False, "msg": "未绑定 Emby 账号"}
+            if user["points"] < cost:
+                await db.rollback()
+                return {"success": False, "msg": f"抽奖需要 {cost} 积分，您当前积分不足！"}
 
-        updated_u = await self.get_user_by_tg(tg_id)
-        prize["remaining_points"] = updated_u.get("points", 0) if updated_u else 0
+            await db.execute("UPDATE users SET points = points - ? WHERE tg_id = ?", (cost, tg_id))
+            roll = random.random() * 100
+            if roll < 5:
+                await db.execute("UPDATE users SET max_devices = max_devices + 1 WHERE tg_id = ?", (tg_id,))
+                async with db.execute("SELECT max_devices FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                    new_devs = (await cursor.fetchone())["max_devices"]
+                prize = {"type": "grand", "msg": f"🎉 欧皇降临！抽中【并发设备 +1 台】（当前上限: {new_devs} 台）"}
+            elif roll < 45:
+                reward_days = 7 if roll < 20 else 3
+                current_expiry = self._as_utc(user["expiry_date"]) or now
+                new_exp = max(current_expiry, now) + datetime.timedelta(days=reward_days)
+                await db.execute("UPDATE users SET expiry_date = ? WHERE tg_id = ?", (new_exp.isoformat(), tg_id))
+                if reward_days == 7:
+                    prize = {"type": "days", "msg": f"🎁 大吉！抽中【7天观影时长】（新到期: {new_exp.strftime('%Y-%m-%d')}）"}
+                else:
+                    prize = {"type": "days", "msg": f"✨ 中奖！抽中【3天观影时长】（新到期: {new_exp.strftime('%Y-%m-%d')}）"}
+            elif roll < 75:
+                await db.execute("UPDATE users SET points = points + 35 WHERE tg_id = ?", (tg_id,))
+                prize = {"type": "points", "msg": "💰 积分红包！抽中【35 积分】（净赚 15 积分）"}
+            else:
+                prize = {"type": "none", "msg": "☕ 差点就中了！获得了【赛博安慰奖：功德 +1】"}
+
+            async with db.execute("SELECT points FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                prize["remaining_points"] = (await cursor.fetchone())["points"]
+            await db.commit()
+
         prize["success"] = True
         return prize
 
@@ -396,33 +433,45 @@ class Database:
         }
 
     async def transfer_points(self, from_tg: int, to_tg: int, amount: int) -> Dict[str, Any]:
-        """Atomic transfer points to prevent double spending"""
+        """Transfer points and write its audit log in one transaction."""
         if amount <= 0:
             return {"success": False, "msg": "转账积分必须大于 0"}
         if from_tg == to_tg:
             return {"success": False, "msg": "不能给自己转账"}
 
-        u_from = await self.get_user_by_tg(from_tg)
-        if not u_from:
-            return {"success": False, "msg": "转账方未绑定 Emby 账号"}
-        
-        u_to = await self.get_user_by_tg(to_tg)
-        if not u_to:
-            return {"success": False, "msg": "收款方未绑定 Emby 账号"}
+        now = datetime.datetime.now(datetime.timezone.utc).isoformat()
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
+            db.row_factory = aiosqlite.Row
+            async with db.execute("SELECT points FROM users WHERE tg_id = ?", (from_tg,)) as cursor:
+                u_from = await cursor.fetchone()
+            if not u_from:
+                await db.rollback()
+                return {"success": False, "msg": "转账方未绑定 Emby 账号"}
+            async with db.execute("SELECT emby_username FROM users WHERE tg_id = ?", (to_tg,)) as cursor:
+                u_to = await cursor.fetchone()
+            if not u_to:
+                await db.rollback()
+                return {"success": False, "msg": "收款方未绑定 Emby 账号"}
+            if u_from["points"] < amount:
+                await db.rollback()
+                return {"success": False, "msg": f"您的积分不足！当前仅有 {u_from['points']} 积分"}
 
-        deducted = await self.deduct_user_points_atomic(from_tg, amount)
-        if not deducted:
-            return {"success": False, "msg": f"您的积分不足！当前仅有 {u_from.get('points', 0)} 积分"}
+            await db.execute("UPDATE users SET points = points - ? WHERE tg_id = ?", (amount, from_tg))
+            await db.execute("UPDATE users SET points = points + ? WHERE tg_id = ?", (amount, to_tg))
+            await db.execute(
+                "INSERT INTO logs (tg_id, action, details, created_at) VALUES (?, ?, ?, ?)",
+                (from_tg, "TRANSFER_POINTS", f"Sent {amount} pts to TG:{to_tg}", now),
+            )
+            async with db.execute("SELECT points FROM users WHERE tg_id = ?", (from_tg,)) as cursor:
+                from_remaining = (await cursor.fetchone())["points"]
+            await db.commit()
 
-        await self.add_user_points(to_tg, amount)
-        await self.log_action(from_tg, "TRANSFER_POINTS", f"Sent {amount} pts to TG:{to_tg}")
-        
-        updated_from = await self.get_user_by_tg(from_tg)
         return {
             "success": True,
             "amount": amount,
-            "from_remaining": updated_from.get("points", 0) if updated_from else 0,
-            "to_username": u_to.get("emby_username")
+            "from_remaining": from_remaining,
+            "to_username": u_to["emby_username"]
         }
 
     async def get_leaderboard(self, limit: int = 10) -> List[Dict[str, Any]]:
@@ -445,36 +494,55 @@ class Database:
         return code
 
     async def redeem_code(self, tg_id: int, code: str) -> Dict[str, Any]:
-        """Redeem a card key atomically to prevent Race Condition double redemption"""
+        """Validate the account, consume the code, and grant its value atomically."""
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
         async with aiosqlite.connect(self.db_path) as db:
+            await db.execute("BEGIN IMMEDIATE")
             db.row_factory = aiosqlite.Row
-            # Step 1: Check existence & state
+            async with db.execute("SELECT * FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                user = await cursor.fetchone()
+            if not user:
+                await db.rollback()
+                return {"success": False, "msg": "请先绑定 Emby 账号后再兑换"}
+
             async with db.execute("SELECT * FROM codes WHERE code = ?", (code,)) as cursor:
                 card = await cursor.fetchone()
                 if not card:
+                    await db.rollback()
                     return {"success": False, "msg": "无效的兑换码"}
                 card = dict(card)
-                if card.get("used_by"):
+                if card.get("used_by") is not None:
+                    await db.rollback()
                     return {"success": False, "msg": "该兑换码已被使用"}
-                
-            # Step 2: Atomic update where used_by IS NULL
+
+            card_type = card.get("card_type")
+            val = card.get("value", 0)
+            if card_type not in ("days", "points") or not isinstance(val, int) or val <= 0:
+                await db.rollback()
+                return {"success": False, "msg": "兑换码数据无效，请联系管理员"}
+
             cursor = await db.execute("UPDATE codes SET used_by = ?, used_at = ? WHERE code = ? AND used_by IS NULL", (tg_id, now, code))
-            await db.commit()
             if cursor.rowcount == 0:
+                await db.rollback()
                 return {"success": False, "msg": "该兑换码刚已被其他请求使用！"}
 
-        card_type = card.get("card_type")
-        val = card.get("value", 0)
-        
-        if card_type == "days":
-            new_exp = await self.extend_user_expiry(tg_id, val)
-            return {"success": True, "type": "days", "value": val, "new_expiry": new_exp.strftime("%Y-%m-%d %H:%M") if new_exp else ""}
-        elif card_type == "points":
-            new_pts = await self.add_user_points(tg_id, val)
-            return {"success": True, "type": "points", "value": val, "total_points": new_pts}
-        
-        return {"success": True, "type": card_type, "value": val}
+            result = {"success": True, "type": card_type, "value": val}
+            if card_type == "days":
+                current_expiry = self._as_utc(user["expiry_date"]) or datetime.datetime.now(datetime.timezone.utc)
+                new_expiry = max(current_expiry, datetime.datetime.now(datetime.timezone.utc)) + datetime.timedelta(days=val)
+                await db.execute(
+                    "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
+                    (new_expiry.isoformat(), tg_id),
+                )
+                result["new_expiry"] = new_expiry.strftime("%Y-%m-%d %H:%M")
+            else:
+                await db.execute("UPDATE users SET points = points + ? WHERE tg_id = ?", (val, tg_id))
+                async with db.execute("SELECT points FROM users WHERE tg_id = ?", (tg_id,)) as cursor:
+                    updated = await cursor.fetchone()
+                result["total_points"] = updated["points"]
+
+            await db.commit()
+            return result
 
     async def log_action(self, tg_id: int, action: str, details: str = ""):
         now = datetime.datetime.now(datetime.timezone.utc).isoformat()
