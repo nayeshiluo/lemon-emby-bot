@@ -1088,10 +1088,12 @@ class LemonEmbyBot:
     async def handle_callback(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         query = update.callback_query
         if not query: return
-        await query.answer()
         data = query.data or ""
         user_id = query.from_user.id
         is_admin = self._is_admin(user_id)
+        duel_action = data.startswith(("cb_accept_duel_", "cb_reject_duel_"))
+        if not duel_action:
+            await query.answer()
 
         if data == "cb_main_menu":
             await query.edit_message_text("🍋 <b>主控制面板</b>", reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
@@ -1112,14 +1114,17 @@ class LemonEmbyBot:
 
         elif data.startswith("cb_accept_duel_"):
             duel_id = data.replace("cb_accept_duel_", "")
-            duel = self.pending_duels.pop(duel_id, None)
+            duel = self.pending_duels.get(duel_id)
             if not duel:
-                await query.edit_message_text("⚠️ 决斗已失效或已超时！")
+                await query.answer("⚠️ 决斗已失效或已超时！", show_alert=True)
                 return
             
             if user_id != duel["u2_tg"]:
                 await query.answer("这不是发给你的决斗挑战哦！", show_alert=True)
                 return
+
+            self.pending_duels.pop(duel_id, None)
+            await query.answer()
 
             res = await self.db.game_pvp_dice_resolve(duel["u1_tg"], duel["u2_tg"], duel["bet"])
             if not res.get("success"):
@@ -1147,11 +1152,18 @@ class LemonEmbyBot:
 
         elif data.startswith("cb_reject_duel_"):
             duel_id = data.replace("cb_reject_duel_", "")
-            duel = self.pending_duels.pop(duel_id, None)
-            if duel:
-                await query.edit_message_text(f"🏳️ 应战方已认怂拒绝了决斗！")
-            else:
-                await query.edit_message_text("决斗已关闭")
+            duel = self.pending_duels.get(duel_id)
+            if not duel:
+                await query.answer("⚠️ 决斗已失效或已超时！", show_alert=True)
+                return
+
+            if user_id != duel["u2_tg"]:
+                await query.answer("这不是发给你的决斗挑战哦！", show_alert=True)
+                return
+
+            self.pending_duels.pop(duel_id, None)
+            await query.answer()
+            await query.edit_message_text("🏳️ 应战方已认怂拒绝了决斗！")
 
         elif data == "cb_my":
             u = await self.db.get_user_by_tg(user_id)
