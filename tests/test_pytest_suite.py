@@ -306,6 +306,37 @@ async def test_password_commands_are_restricted_to_private_chats():
     assert msg.delete_calls == 2
 
 @pytest.mark.asyncio
+async def test_group_gen_does_not_generate_or_disclose_codes():
+    class FakeMessage:
+        def __init__(self):
+            self.deleted = False
+            self.replies = []
+
+        async def delete(self):
+            self.deleted = True
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = [101]
+    bot.db = SimpleNamespace(generate_code=AsyncMock())
+    msg = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=101),
+        effective_chat=SimpleNamespace(type="group"),
+        message=msg,
+    )
+
+    await bot.cmd_gen(update, SimpleNamespace(args=["30", "3"]))
+
+    assert msg.deleted is True
+    assert len(msg.replies) == 1
+    assert "私聊" in msg.replies[0]
+    bot.db.generate_code.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_successful_transfer_command_replies_without_renewal_state():
     class FakeMessage:
         reply_to_message = None
