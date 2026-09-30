@@ -70,7 +70,7 @@ def create_app(config: dict, db, emby_client):
         response = await call_next(request)
         response.headers["Content-Security-Policy"] = (
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-eval'; "
+            "script-src 'self'; "
             "style-src 'self'; "
             "font-src 'self'; "
             "img-src 'self' data:; "

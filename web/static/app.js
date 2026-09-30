@@ -1,5 +1,6 @@
 const { createApp, ref, onMounted } = Vue
     createApp({
+      render: window.LemonAdminRender,
       setup() {
         const token = ref(sessionStorage.getItem('lemon_token') || '')
         const stats = ref({})

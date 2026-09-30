@@ -54,5 +54,7 @@ jobs:
         run: npm ci
       - name: Build local admin assets
         run: npm run build:web-assets
+      - name: Smoke test precompiled Vue render
+        run: npm run test:web-assets
       - name: Verify committed assets are reproducible
-        run: git diff --exit-code -- web/static/app.css web/static/vendor
+        run: git diff --exit-code -- web/static/app.css web/static/app-template.js web/static/vendor

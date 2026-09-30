@@ -656,20 +656,28 @@ def test_web_api_security():
         index = client.get("/")
         assert index.status_code == 200
         policy = index.headers["content-security-policy"]
-        assert "script-src 'self' 'unsafe-eval'" in policy
+        assert "script-src 'self';" in policy
+        assert "unsafe-eval" not in policy
         assert "frame-ancestors 'none'" in policy
         assert index.headers["x-content-type-options"] == "nosniff"
         assert "https://" not in index.text
         assert "/static/app.css" in index.text
         assert "/static/app.js" in index.text
+        assert "/static/app-template.js" in index.text
+        assert "/static/vendor/vue.runtime.global.prod.js" in index.text
         for asset in (
             "/static/app.css",
             "/static/app.js",
-            "/static/vendor/vue.global.prod.js",
+            "/static/app-template.js",
+            "/static/vendor/vue.runtime.global.prod.js",
             "/static/vendor/fontawesome/css/all.min.css",
             "/static/vendor/fontawesome/webfonts/fa-solid-900.woff2",
         ):
             assert client.get(asset).status_code == 200
+
+        template_js = client.get("/static/app-template.js")
+        assert "LemonAdminRender" in template_js.text
+        assert "new Function" not in template_js.text
 
         r1 = client.get("/api/users")
         assert r1.status_code == 401

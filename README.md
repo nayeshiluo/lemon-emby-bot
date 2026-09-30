@@ -26,8 +26,9 @@
    - 无论配置的模板用户权限如何，新创建账号强制剥离管理员权限（`IsAdministrator=False`），杜绝越权提权。
 6. **Web 管理台资源与浏览器策略：**
    - Vue、Tailwind CSS 与 Font Awesome 固定版本并作为本地静态资源提供，管理页不再依赖第三方 CDN；
-   - 管理 API 返回内容安全策略与防嵌入等浏览器安全响应头；
-   - 版本锁在 `package-lock.json`，使用 `npm ci && npm run build:web-assets` 重建，随仓库保留上游许可证。
+   - Vue 模板在构建期预编译，生产只使用 runtime-only 构建，CSP 无需 unsafe-eval；
+   - 管理 API 返回严格 CSP 与防嵌入等浏览器安全响应头；
+   - 版本锁在 `package-lock.json`，使用 `npm ci && npm run build:web-assets` 重建，随仓库保留上游许可证。；预编译渲染可用 npm run test:web-assets 验证。
 
 ---
 
