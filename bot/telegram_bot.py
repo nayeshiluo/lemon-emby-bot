@@ -240,7 +240,7 @@ class LemonEmbyBot:
             )
             return
 
-        expiry = datetime.datetime.fromisoformat(u["expiry_date"])
+        expiry = self.db.as_utc(u["expiry_date"])
         now = datetime.datetime.now(datetime.timezone.utc)
         delta_days = (expiry - now).days
         status_tag = "🔴 已过期/冻结" if (delta_days < 0 or u.get("is_disabled")) else f"🟢 正常 (剩余 {delta_days} 天)"
@@ -590,7 +590,7 @@ class LemonEmbyBot:
             await update.message.reply_text("🔒 仅管理员可查询其他用户的详细档案！", parse_mode="HTML")
             return
 
-        expiry = datetime.datetime.fromisoformat(u_db["expiry_date"])
+        expiry = self.db.as_utc(u_db["expiry_date"])
         now = datetime.datetime.now(datetime.timezone.utc)
         delta_days = (expiry - now).days
         status_tag = "🔴 已过期/冻结" if (delta_days < 0 or u_db.get("is_disabled")) else f"🟢 正常 (剩余 {delta_days} 天)"
@@ -1158,7 +1158,7 @@ class LemonEmbyBot:
             if not u:
                 await query.edit_message_text("❌ 尚未绑定 Emby 账号！请使用 /bind 账号 密码 绑定。", reply_markup=self._get_main_keyboard(is_admin))
                 return
-            expiry = datetime.datetime.fromisoformat(u["expiry_date"])
+            expiry = self.db.as_utc(u["expiry_date"])
             now = datetime.datetime.now(datetime.timezone.utc)
             delta_days = (expiry - now).days
             status_tag = "🔴 已过期" if delta_days < 0 else f"🟢 正常 (余 {delta_days} 天)"
