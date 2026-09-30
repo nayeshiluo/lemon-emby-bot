@@ -638,6 +638,57 @@ def test_web_auth_failure_tracking_is_bounded_lru_and_expires(monkeypatch):
         FAILED_ATTEMPTS.clear()
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("action", ["accept", "reject"])
+async def test_bystander_cannot_accept_or_reject_duel(action):
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = []
+    bot.pending_duels = {
+        "duel1234": {"u1_tg": 1001, "u2_tg": 1002, "bet": 10}
+    }
+    query = SimpleNamespace(
+        data=f"cb_{action}_duel_duel1234",
+        from_user=SimpleNamespace(id=1003),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await bot.handle_callback(SimpleNamespace(callback_query=query), SimpleNamespace())
+
+    assert "duel1234" in bot.pending_duels
+    query.answer.assert_awaited_once_with("这不是发给你的决斗挑战哦！", show_alert=True)
+    query.edit_message_text.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_duel_target_can_accept_pending_duel_once():
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = []
+    bot.pending_duels = {
+        "duel5678": {
+            "u1_tg": 1001, "u2_tg": 1002, "u1_name": "Alice",
+            "u2_name": "Bob", "bet": 10
+        }
+    }
+    bot.db = SimpleNamespace(game_pvp_dice_resolve=AsyncMock(return_value={
+        "success": True, "outcome": "tie", "u1_roll": 3, "u2_roll": 3,
+        "u1_name": "Alice", "u2_name": "Bob", "bet": 10
+    }))
+    query = SimpleNamespace(
+        data="cb_accept_duel_duel5678",
+        from_user=SimpleNamespace(id=1002),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+
+    await bot.handle_callback(SimpleNamespace(callback_query=query), SimpleNamespace())
+
+    assert "duel5678" not in bot.pending_duels
+    bot.db.game_pvp_dice_resolve.assert_awaited_once_with(1001, 1002, 10)
+    query.answer.assert_awaited_once_with()
+    query.edit_message_text.assert_awaited_once()
+
+
 def test_web_api_security():
     FAILED_ATTEMPTS.clear()
     import asyncio
