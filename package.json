@@ -1,0 +1,13 @@
+{
+  "name": "lemon-emby-web-assets",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "build:web-assets": "tailwindcss --config tailwind.config.cjs --input web/static/css/input.css --output web/static/app.css --minify && node scripts/build-web-assets.cjs"
+  },
+  "devDependencies": {
+    "@fortawesome/fontawesome-free": "6.4.0",
+    "tailwindcss": "3.4.17",
+    "vue": "3.5.43"
+  }
+}

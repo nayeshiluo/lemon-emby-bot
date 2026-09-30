@@ -653,6 +653,24 @@ def test_web_api_security():
     client = TestClient(app)
 
     try:
+        index = client.get("/")
+        assert index.status_code == 200
+        policy = index.headers["content-security-policy"]
+        assert "script-src 'self' 'unsafe-eval'" in policy
+        assert "frame-ancestors 'none'" in policy
+        assert index.headers["x-content-type-options"] == "nosniff"
+        assert "https://" not in index.text
+        assert "/static/app.css" in index.text
+        assert "/static/app.js" in index.text
+        for asset in (
+            "/static/app.css",
+            "/static/app.js",
+            "/static/vendor/vue.global.prod.js",
+            "/static/vendor/fontawesome/css/all.min.css",
+            "/static/vendor/fontawesome/webfonts/fa-solid-900.woff2",
+        ):
+            assert client.get(asset).status_code == 200
+
         r1 = client.get("/api/users")
         assert r1.status_code == 401
 

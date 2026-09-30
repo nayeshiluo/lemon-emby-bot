@@ -65,6 +65,26 @@ def create_app(config: dict, db, emby_client):
             "set a strong unique secret in config.yaml"
         )
 
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-eval'; "
+            "style-src 'self'; "
+            "font-src 'self'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "object-src 'none'; "
+            "base-uri 'self'; "
+            "frame-ancestors 'none'; "
+            "form-action 'self'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
+
     async def verify_auth(request: Request, x_admin_token: Optional[str] = Header(None)):
         client_ip = request.client.host if request.client else "unknown"
         check_ip_rate_limit(client_ip)
