@@ -51,7 +51,7 @@ class BackgroundScheduler:
             if not expiry_str:
                 continue
             
-            expiry = datetime.datetime.fromisoformat(expiry_str)
+            expiry = self.db.as_utc(expiry_str)
             tg_id = u["tg_id"]
             emby_user_id = u["emby_user_id"]
             is_disabled = u.get("is_disabled", 0)
