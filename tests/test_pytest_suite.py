@@ -14,6 +14,7 @@ from core.database import Database
 from core.emby import EmbyClient
 from core.scheduler import BackgroundScheduler
 from web.api import create_app, FAILED_ATTEMPTS
+from web import api as web_api
 from starlette.testclient import TestClient
 
 TEST_DB_PATH = "test_lemon_emby_pytest.db"
@@ -610,6 +611,32 @@ async def test_concurrent_transfers_are_atomic(test_db):
     assert sum(result["success"] for result in results) == 1
     assert (await test_db.get_user_by_tg(4001))["points"] == 40
     assert (await test_db.get_user_by_tg(4002))["points"] == 60
+
+def test_web_auth_failure_tracking_is_bounded_lru_and_expires(monkeypatch):
+    FAILED_ATTEMPTS.clear()
+    now = [100.0]
+    monkeypatch.setattr(web_api, "MAX_TRACKED_IPS", 2)
+    monkeypatch.setattr(web_api.time, "monotonic", lambda: now[0])
+
+    try:
+        for _ in range(web_api.MAX_FAILS):
+            web_api.record_failed_attempt("client-a")
+        web_api.record_failed_attempt("client-b")
+
+        with pytest.raises(web_api.HTTPException):
+            web_api.check_ip_rate_limit("client-a")
+        web_api.record_failed_attempt("client-c")
+
+        assert list(FAILED_ATTEMPTS) == ["client-a", "client-c"]
+        with pytest.raises(web_api.HTTPException):
+            web_api.check_ip_rate_limit("client-a")
+
+        now[0] += web_api.LOCKOUT_SECONDS + 1
+        web_api.check_ip_rate_limit("client-a")
+        assert "client-a" not in FAILED_ATTEMPTS
+    finally:
+        FAILED_ATTEMPTS.clear()
+
 
 def test_web_api_security():
     FAILED_ATTEMPTS.clear()
