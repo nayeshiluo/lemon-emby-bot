@@ -7,6 +7,9 @@ const runtimePath = "web/static/vendor/vue.runtime.global.prod.js";
 const renderPath = "web/static/app-template.js";
 const runtimeSource = fs.readFileSync(runtimePath, "utf8");
 const renderSource = fs.readFileSync(renderPath, "utf8");
+const appSource = fs.readFileSync("web/static/app.js", "utf8");
+assert.doesNotMatch(appSource, /\b(?:sessionStorage|localStorage)\b/);
+assert.doesNotMatch(appSource, /lemon_token/);
 
 assert.match(index, /vue\.runtime\.global\.prod\.js/);
 assert.match(index, /\/static\/app-template\.js/);
