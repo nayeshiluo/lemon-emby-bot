@@ -89,8 +89,8 @@ async def test_concurrent_expiry_extensions_are_not_lost(test_db):
 
     await asyncio.gather(*(test_db.extend_user_expiry(1004, 5) for _ in range(4)))
 
-    expiry = test_db._as_utc((await test_db.get_user_by_tg(1004))["expiry_date"])
-    assert expiry == test_db._as_utc(original) + datetime.timedelta(days=20)
+    expiry = test_db.as_utc((await test_db.get_user_by_tg(1004))["expiry_date"])
+    assert expiry == test_db.as_utc(original) + datetime.timedelta(days=20)
     assert (await test_db.get_user_by_tg(1004))["is_disabled"] == 1
 
 @pytest.mark.asyncio
