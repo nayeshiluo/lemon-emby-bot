@@ -689,6 +689,49 @@ async def test_duel_target_can_accept_pending_duel_once():
     query.edit_message_text.assert_awaited_once()
 
 
+@pytest.mark.asyncio
+async def test_help_marks_sensitive_commands_private():
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = [1001]
+    message = SimpleNamespace(reply_text=AsyncMock())
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1001),
+        message=message,
+    )
+
+    await bot.cmd_help(update, SimpleNamespace())
+
+    help_text = message.reply_text.await_args.args[0]
+    for command in ("/bind", "/redeem", "/resetpw"):
+        line = next(line for line in help_text.splitlines() if command in line)
+        assert "仅限私聊" in line
+    assert "随机密码私聊发送" in help_text
+    assert "指定密码请在私聊操作" in help_text
+
+
+@pytest.mark.asyncio
+async def test_group_create_requires_reply_target_to_avoid_orphan_accounts():
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = [1001]
+    bot.db = SimpleNamespace(get_user_by_username=AsyncMock())
+    message = SimpleNamespace(
+        reply_to_message=None,
+        reply_text=AsyncMock(),
+    )
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=1001),
+        effective_chat=SimpleNamespace(type="group"),
+        message=message,
+    )
+
+    await bot.cmd_create(update, SimpleNamespace(args=["orphan-account"]))
+
+    bot.db.get_user_by_username.assert_not_awaited()
+    guidance = message.reply_text.await_args.args[0]
+    assert "回复目标群友的消息" in guidance
+    assert "私聊" in guidance
+
+
 def test_web_api_security():
     FAILED_ATTEMPTS.clear()
     import asyncio
