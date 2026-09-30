@@ -950,6 +950,10 @@ class LemonEmbyBot:
     async def cmd_gen(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user or not update.message or not self._is_admin(update.effective_user.id):
             return
+        if not self._is_private_chat(update):
+            await self._delete_sensitive_command(update)
+            await update.message.reply_text("🔒 卡密属于一次性凭据，请在与 Bot 的私聊中使用 /gen。")
+            return
         args = context.args
         if not args:
             await update.message.reply_text("💡 管理员格式：<code>/gen &lt;天数&gt; [张数]</code>", parse_mode="HTML")
