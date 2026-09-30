@@ -49,6 +49,16 @@ class LemonEmbyBot:
     def _is_private_chat(update: Update) -> bool:
         return bool(update.effective_chat and update.effective_chat.type == "private")
 
+    @staticmethod
+    async def _delete_sensitive_command(update: Update) -> None:
+        """Best-effort removal of a group command containing credentials."""
+        if not update.message:
+            return
+        try:
+            await update.message.delete()
+        except Exception:
+            logger.debug("Could not delete sensitive Telegram command message", exc_info=True)
+
     async def _reactivate_if_disabled(self, tg_id: int) -> bool:
         """Only reactivate accounts disabled by expiry, never admin-disabled accounts."""
         user = await self.db.get_user_by_tg(tg_id)
@@ -619,6 +629,7 @@ class LemonEmbyBot:
         reply_msg = update.message.reply_to_message
         args = context.args
         if not self._is_private_chat(update) and len(args) > 1:
+            await self._delete_sensitive_command(update)
             await update.message.reply_text(
                 "🔒 群聊开号请省略密码参数，Bot 会私聊发送随机密码；如需指定密码，请在私聊中执行。"
             )
@@ -696,8 +707,12 @@ class LemonEmbyBot:
                     parse_mode="HTML",
                 )
                 return
-            await self.emby.update_user_password(emby_user_id, password)
-            await self.emby.set_user_disabled(emby_user_id, False)
+            if not await self.emby.update_user_password(emby_user_id, password):
+                await update.message.reply_text("❌ 无法为现有 Emby 用户设置密码，未创建本地账号记录。")
+                return
+            if not await self.emby.set_user_disabled(emby_user_id, False):
+                await update.message.reply_text("❌ 无法启用现有 Emby 用户，未创建本地账号记录。")
+                return
         else:
             new_u = await self.emby.create_user(username, password)
             if not new_u:
@@ -777,7 +792,9 @@ class LemonEmbyBot:
         tg_id = u_db.get("tg_id")
 
         if emby_uid:
-            await self.emby.delete_user(emby_uid)
+            if not await self.emby.delete_user(emby_uid):
+                await update.message.reply_text("❌ Emby 删除失败；本地账号记录已保留，请检查服务器后重试。")
+                return
         await self.db.delete_user_record(tg_id)
         await self.db.log_action(update.effective_user.id, "ADMIN_DELETE", f"Deleted {username} (TG: {tg_id})")
         await update.message.reply_text(f"🗑️ 已成功删除用户 <code>{html.escape(username)}</code> (TG: <code>{tg_id}</code>) 的 Emby 账号及全部数据！", parse_mode="HTML")
@@ -812,6 +829,7 @@ class LemonEmbyBot:
         if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
         if not self._is_private_chat(update):
+            await self._delete_sensitive_command(update)
             await update.message.reply_text("🔒 为保护账号安全，请在与 Bot 的私聊中使用 /bind；群聊不会处理账号凭据。")
             return
         args = context.args
@@ -870,6 +888,10 @@ class LemonEmbyBot:
     async def cmd_redeem(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
+        if not self._is_private_chat(update):
+            await self._delete_sensitive_command(update)
+            await update.message.reply_text("🔒 卡密属于一次性凭据，请在与 Bot 的私聊中使用 /redeem；本次群聊指令未处理。")
+            return
         args = context.args
         if not args:
             await update.message.reply_text("💡 使用格式：<code>/redeem &lt;卡密兑换码&gt;</code>", parse_mode="HTML")
@@ -899,6 +921,7 @@ class LemonEmbyBot:
         if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
         if not self._is_private_chat(update):
+            await self._delete_sensitive_command(update)
             await update.message.reply_text("🔒 为保护密码安全，请在与 Bot 的私聊中使用 /resetpw。")
             return
         args = context.args
@@ -1001,7 +1024,9 @@ class LemonEmbyBot:
         username = args[0]
         emby_u = await self.emby.get_user_by_name(username)
         if emby_u:
-            await self.emby.set_user_disabled(emby_u["Id"], True)
+            if not await self.emby.set_user_disabled(emby_u["Id"], True):
+                await update.message.reply_text("❌ Emby 禁用失败，本地状态未更改，请检查服务器后重试。")
+                return
             u_db = await self.db.get_user_by_emby_id(emby_u["Id"])
             if u_db:
                 await self.db.update_user_status(u_db["tg_id"], True, reason="admin")
@@ -1019,7 +1044,9 @@ class LemonEmbyBot:
         username = args[0]
         emby_u = await self.emby.get_user_by_name(username)
         if emby_u:
-            await self.emby.set_user_disabled(emby_u["Id"], False)
+            if not await self.emby.set_user_disabled(emby_u["Id"], False):
+                await update.message.reply_text("❌ Emby 解禁失败，本地状态未更改，请检查服务器后重试。")
+                return
             u_db = await self.db.get_user_by_emby_id(emby_u["Id"])
             if u_db:
                 await self.db.update_user_status(u_db["tg_id"], False)
