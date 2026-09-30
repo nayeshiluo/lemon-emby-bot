@@ -14,7 +14,7 @@ class Database:
         self.db_path = db_path
 
     @staticmethod
-    def _as_utc(value: Optional[str]) -> Optional[datetime.datetime]:
+    def as_utc(value: Optional[str]) -> Optional[datetime.datetime]:
         """Parse stored timestamps consistently, including legacy naive values."""
         if not value:
             return None
@@ -128,7 +128,7 @@ class Database:
                 await db.rollback()
                 return None
 
-            current_expiry = self._as_utc(user["expiry_date"]) or now
+            current_expiry = self.as_utc(user["expiry_date"]) or now
             new_expiry = max(current_expiry, now) + datetime.timedelta(days=days)
             await db.execute(
                 "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
@@ -187,12 +187,12 @@ class Database:
                 await db.rollback()
                 return {"success": False, "msg": "未绑定 Emby 账号"}
 
-            last_checkin = self._as_utc(user["last_checkin"])
+            last_checkin = self.as_utc(user["last_checkin"])
             if last_checkin and last_checkin.date() == now.date():
                 await db.rollback()
                 return {"success": False, "msg": "今天已经签过到啦，明天再来吧！"}
 
-            current_expiry = self._as_utc(user["expiry_date"]) or now
+            current_expiry = self.as_utc(user["expiry_date"]) or now
             new_expiry = max(current_expiry, now) + datetime.timedelta(days=reward_days) if reward_days > 0 else current_expiry
             await db.execute(
                 "UPDATE users SET last_checkin = ?, points = points + ?, expiry_date = ? WHERE tg_id = ?",
@@ -238,7 +238,7 @@ class Database:
 
             await db.execute("UPDATE users SET points = points - ? WHERE tg_id = ?", (cost, tg_id))
             if item["type"] == "days":
-                current_expiry = self._as_utc(user["expiry_date"]) or now
+                current_expiry = self.as_utc(user["expiry_date"]) or now
                 new_expiry = max(current_expiry, now) + datetime.timedelta(days=item["val"])
                 await db.execute(
                     "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
@@ -290,7 +290,7 @@ class Database:
                 prize = {"type": "grand", "msg": f"🎉 欧皇降临！抽中【并发设备 +1 台】（当前上限: {new_devs} 台）"}
             elif roll < 45:
                 reward_days = 7 if roll < 20 else 3
-                current_expiry = self._as_utc(user["expiry_date"]) or now
+                current_expiry = self.as_utc(user["expiry_date"]) or now
                 new_exp = max(current_expiry, now) + datetime.timedelta(days=reward_days)
                 await db.execute("UPDATE users SET expiry_date = ? WHERE tg_id = ?", (new_exp.isoformat(), tg_id))
                 if reward_days == 7:
@@ -553,7 +553,7 @@ class Database:
 
             result = {"success": True, "type": card_type, "value": val}
             if card_type == "days":
-                current_expiry = self._as_utc(user["expiry_date"]) or datetime.datetime.now(datetime.timezone.utc)
+                current_expiry = self.as_utc(user["expiry_date"]) or datetime.datetime.now(datetime.timezone.utc)
                 new_expiry = max(current_expiry, datetime.datetime.now(datetime.timezone.utc)) + datetime.timedelta(days=val)
                 await db.execute(
                     "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
