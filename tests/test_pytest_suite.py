@@ -239,9 +239,13 @@ async def test_password_commands_are_restricted_to_private_chats():
 
         def __init__(self):
             self.replies = []
+            self.delete_calls = 0
 
         async def reply_text(self, text, **kwargs):
             self.replies.append(text)
+
+        async def delete(self):
+            self.delete_calls += 1
 
     bot = object.__new__(LemonEmbyBot)
     bot.admin_ids = [101]
@@ -259,6 +263,7 @@ async def test_password_commands_are_restricted_to_private_chats():
 
     assert len(msg.replies) == 2
     assert all("私聊" in reply for reply in msg.replies)
+    assert msg.delete_calls == 2
 
 @pytest.mark.asyncio
 async def test_successful_transfer_command_replies_without_renewal_state():
@@ -288,6 +293,156 @@ async def test_successful_transfer_command_replies_without_renewal_state():
 
     assert bot.db.transfer_points.await_count == 1
     assert "积分转账成功" in msg.replies[0]
+
+@pytest.mark.asyncio
+async def test_group_redeem_deletes_command_and_does_not_consume_code():
+    class FakeMessage:
+        async def delete(self):
+            self.deleted = True
+
+        async def reply_text(self, text, **kwargs):
+            self.reply = text
+
+    bot = object.__new__(LemonEmbyBot)
+    bot.db = SimpleNamespace(redeem_code=AsyncMock())
+    msg = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=301),
+        effective_chat=SimpleNamespace(type="group"),
+        message=msg,
+    )
+
+    await bot.cmd_redeem(update, SimpleNamespace(args=["LEMON-SECRET-CODE"]))
+
+    assert msg.deleted is True
+    assert "私聊" in msg.reply
+    bot.db.redeem_code.assert_not_awaited()
+
+@pytest.mark.asyncio
+async def test_failed_emby_delete_keeps_local_account_record():
+    class FakeMessage:
+        reply_to_message = None
+
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = [1]
+    bot.db = SimpleNamespace(
+        get_user_by_identifier=AsyncMock(return_value={
+            "tg_id": 401, "emby_user_id": "emby401", "emby_username": "viewer"
+        }),
+        delete_user_record=AsyncMock(),
+        log_action=AsyncMock(),
+    )
+    bot.emby = SimpleNamespace(delete_user=AsyncMock(return_value=False))
+    msg = FakeMessage()
+
+    await bot.cmd_deluser(
+        SimpleNamespace(effective_user=SimpleNamespace(id=1), message=msg),
+        SimpleNamespace(args=["401"]),
+    )
+
+    bot.db.delete_user_record.assert_not_awaited()
+    assert "Emby 删除失败" in msg.replies[0]
+
+@pytest.mark.asyncio
+async def test_create_user_cleans_up_when_password_or_template_application_fails():
+    client = EmbyClient("http://127.0.0.1:8096", "dummy")
+    client._request = AsyncMock(side_effect=[{"Id": "new-user"}, ""])
+    client.update_user_password = AsyncMock(return_value=False)
+
+    assert await client.create_user("name", "password") is None
+    assert client._request.await_args_list[-1].args[:2] == ("DELETE", "/Users/new-user")
+
+    client = EmbyClient("http://127.0.0.1:8096", "dummy", template_user_id="template")
+    client._request = AsyncMock(side_effect=[{"Id": "new-user"}, ""])
+    client.update_user_password = AsyncMock(return_value=True)
+    client.get_user = AsyncMock(return_value=None)
+
+    assert await client.create_user("name", "password") is None
+    assert client._request.await_args_list[-1].args[:2] == ("DELETE", "/Users/new-user")
+
+    client = EmbyClient("http://127.0.0.1:8096", "dummy", template_user_id="template")
+    client._request = AsyncMock(side_effect=[{"Id": "new-user"}, None, ""])
+    client.update_user_password = AsyncMock(return_value=True)
+    client.get_user = AsyncMock(return_value={"Policy": {"IsAdministrator": True}})
+
+    assert await client.create_user("name", "password") is None
+    assert client._request.await_args_list[1].kwargs["json"]["IsAdministrator"] is False
+    assert client._request.await_args_list[-1].args[:2] == ("DELETE", "/Users/new-user")
+
+@pytest.mark.asyncio
+async def test_admin_create_stops_if_existing_emby_password_update_fails():
+    class FakeMessage:
+        reply_to_message = None
+
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = [1]
+    bot.config = {}
+    bot.db = SimpleNamespace(
+        get_user_by_username=AsyncMock(return_value=None),
+        get_user_by_emby_id=AsyncMock(return_value=None),
+        create_user_record=AsyncMock(return_value=True),
+        log_action=AsyncMock(),
+    )
+    bot.emby = SimpleNamespace(
+        get_user_by_name=AsyncMock(return_value={"Id": "existing-user"}),
+        update_user_password=AsyncMock(return_value=False),
+        set_user_disabled=AsyncMock(return_value=True),
+    )
+    msg = FakeMessage()
+
+    await bot.cmd_create(
+        SimpleNamespace(
+            effective_user=SimpleNamespace(id=1),
+            effective_chat=SimpleNamespace(type="private"),
+            message=msg,
+        ),
+        SimpleNamespace(args=["existing", "password"]),
+    )
+
+    bot.db.create_user_record.assert_not_awaited()
+    assert "设置密码" in msg.replies[0]
+
+@pytest.mark.asyncio
+async def test_ban_commands_do_not_update_local_state_when_emby_fails():
+    class FakeMessage:
+        reply_to_message = None
+
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = [1]
+    bot.db = SimpleNamespace(
+        get_user_by_emby_id=AsyncMock(return_value={"tg_id": 501}),
+        update_user_status=AsyncMock(),
+    )
+    bot.emby = SimpleNamespace(
+        get_user_by_name=AsyncMock(return_value={"Id": "emby501"}),
+        set_user_disabled=AsyncMock(return_value=False),
+    )
+    msg = FakeMessage()
+    update = SimpleNamespace(effective_user=SimpleNamespace(id=1), message=msg)
+
+    await bot.cmd_ban(update, SimpleNamespace(args=["viewer"]))
+    await bot.cmd_unban(update, SimpleNamespace(args=["viewer"]))
+
+    bot.db.update_user_status.assert_not_awaited()
+    assert all("失败" in reply for reply in msg.replies)
 
 @pytest.mark.asyncio
 async def test_atomic_double_spend_prevention(test_db):
@@ -349,6 +504,42 @@ async def test_mini_games(test_db):
 
     pvp_res = await test_db.game_pvp_dice_resolve(2001, 2002, bet=20)
     assert pvp_res["success"] is True
+
+@pytest.mark.asyncio
+async def test_game_settlement_failures_roll_back_all_balances(test_db):
+    import aiosqlite
+    from unittest.mock import patch
+
+    for tg_id in range(8001, 8007):
+        await test_db.create_user_record(tg_id, f"emby_{tg_id}", f"user_{tg_id}", days=30)
+        await test_db.add_user_points(tg_id, 100)
+
+    async with aiosqlite.connect(test_db.db_path) as conn:
+        await conn.execute("""
+            CREATE TRIGGER reject_game_payout
+            BEFORE UPDATE OF points ON users
+            WHEN NEW.tg_id IN (8001, 8003, 8005) AND NEW.points > OLD.points
+            BEGIN SELECT RAISE(ABORT, 'injected payout failure'); END
+        """)
+        await conn.commit()
+
+    with patch("core.database.random.randint", side_effect=[6, 1]):
+        with pytest.raises(aiosqlite.IntegrityError):
+            await test_db.game_dice_bot(8001, bet=20)
+    assert (await test_db.get_user_by_tg(8001))["points"] == 100
+
+    with patch("core.database.random.randint", side_effect=[1, 6]):
+        with pytest.raises(aiosqlite.IntegrityError):
+            await test_db.game_pvp_dice_resolve(8002, 8003, bet=20)
+    assert (await test_db.get_user_by_tg(8002))["points"] == 100
+    assert (await test_db.get_user_by_tg(8003))["points"] == 100
+
+    with patch("core.database.random.random", return_value=0.0), \
+         patch("core.database.random.randint", return_value=25):
+        with pytest.raises(aiosqlite.IntegrityError):
+            await test_db.game_rob(8005, 8006)
+    assert (await test_db.get_user_by_tg(8005))["points"] == 100
+    assert (await test_db.get_user_by_tg(8006))["points"] == 100
 
 @pytest.mark.asyncio
 async def test_points_transfer_and_leaderboard(test_db):
