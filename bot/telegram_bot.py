@@ -207,14 +207,14 @@ class LemonEmbyBot:
             "• <code>/rob</code> - 打劫群友积分（回复某人发送，有反杀风险）\n"
             "• <code>/transfer &lt;用户&gt; &lt;积分&gt;</code> - 积分转账给群友\n"
             "• <code>/rank</code> - 查看群内积分富豪榜\n"
-            "• <code>/bind &lt;账号&gt; &lt;密码&gt;</code> - 开通或绑定 Emby 账号\n"
-            "• <code>/redeem &lt;卡密&gt;</code> - 使用兑换码续费\n"
-            "• <code>/resetpw &lt;新密码&gt;</code> - 自助修改 Emby 密码\n"
+            "• <code>/bind &lt;账号&gt; &lt;密码&gt;</code> - 开通或绑定 Emby 账号（仅限私聊）\n"
+            "• <code>/redeem &lt;卡密&gt;</code> - 使用兑换码续费（仅限私聊）\n"
+            "• <code>/resetpw &lt;新密码&gt;</code> - 自助修改 Emby 密码（仅限私聊）\n"
             "• <code>/info</code> - 查看账号状态（支持回复他人消息查号）\n"
         )
         admin_help = (
             "\n👑 <b>管理员特权快捷指令：</b>\n"
-            "• <b>一键开号：</b> 回复群友发送 <code>/create [天数] [密码]</code>\n"
+            "• <b>一键开号：</b> 群聊中回复目标用户并发送 <code>/create [天数]</code>（随机密码私聊发送；指定密码请在私聊操作）\n"
             "• <b>一键查号：</b> 回复群友发送 <code>/info</code>\n"
             "• <b>一键销号：</b> 回复群友发送 <code>/deluser</code>\n"
             "• <code>/addpts &lt;用户名/TG_ID&gt; &lt;点数&gt;</code> - 给用户发放积分\n"
@@ -235,7 +235,7 @@ class LemonEmbyBot:
         if not u:
             await update.message.reply_text(
                 "❌ <b>尚未绑定 Emby 账号！</b>\n\n"
-                "请使用 <code>/bind 用户名 密码</code> 快速注册/绑定你的专属账号。",
+                "请在与 Bot 的私聊中使用 <code>/bind 用户名 密码</code> 注册/绑定账号。",
                 parse_mode="HTML"
             )
             return
@@ -256,7 +256,7 @@ class LemonEmbyBot:
             f"📱 <b>最大设备限制：</b> <code>{u.get('max_devices', 2)}</code> 台\n"
             f"🌐 <b>服务器地址：</b> <code>{html.escape(self.config.get('emby', {}).get('public_url', ''))}</code>\n"
             f"━━━━━━━━━━━━━━━━━━━━\n"
-            f"💡 <i>提示：发送 <code>/resetpw 新密码</code> 可自助修改密码。</i>"
+            f"💡 <i>提示：请在与 Bot 私聊时发送 <code>/resetpw 新密码</code> 修改密码。</i>"
         )
         await update.message.reply_text(text, parse_mode="HTML")
 
@@ -634,6 +634,11 @@ class LemonEmbyBot:
                 "🔒 群聊开号请省略密码参数，Bot 会私聊发送随机密码；如需指定密码，请在私聊中执行。"
             )
             return
+        if not self._is_private_chat(update) and args and not reply_msg:
+            await update.message.reply_text(
+                "🔒 群聊开号请回复目标群友的消息并使用 /create [天数]；直接指定用户名或 TG_ID 请在私聊中操作。"
+            )
+            return
         target_tg_id = None
         username = None
         password = None
@@ -661,8 +666,8 @@ class LemonEmbyBot:
             if not args:
                 await update.message.reply_text(
                     "💡 <b>一键开号指令说明：</b>\n\n"
-                    "1️⃣ <b>回复开号：</b> 选中群友消息直接回复 <code>/create [天数] [密码]</code>\n"
-                    "2️⃣ <b>直接开号：</b> <code>/create &lt;用户名&gt; [密码] [天数] [TG_ID]</code>",
+                    "1️⃣ <b>群聊开号：</b> 回复目标群友的消息发送 <code>/create [天数]</code>（随机密码会私聊发送）\n"
+                    "2️⃣ <b>私聊开号：</b> <code>/create &lt;用户名&gt; [密码] [天数] [TG_ID]</code>（指定密码或 TG_ID 请在私聊操作）",
                     parse_mode="HTML"
                 )
                 return
@@ -834,7 +839,7 @@ class LemonEmbyBot:
             return
         args = context.args
         if not args or len(args) < 2:
-            await update.message.reply_text("💡 使用格式：<code>/bind &lt;用户名&gt; &lt;密码&gt;</code>", parse_mode="HTML")
+            await update.message.reply_text("💡 仅限与 Bot 私聊使用，格式：<code>/bind &lt;用户名&gt; &lt;密码&gt;</code>", parse_mode="HTML")
             return
 
         username = "".join(c for c in args[0].strip() if c.isalnum() or c in "_-")
@@ -894,7 +899,7 @@ class LemonEmbyBot:
             return
         args = context.args
         if not args:
-            await update.message.reply_text("💡 使用格式：<code>/redeem &lt;卡密兑换码&gt;</code>", parse_mode="HTML")
+            await update.message.reply_text("💡 仅限与 Bot 私聊使用，格式：<code>/redeem &lt;卡密兑换码&gt;</code>", parse_mode="HTML")
             return
 
         code = args[0].strip()
@@ -926,7 +931,7 @@ class LemonEmbyBot:
             return
         args = context.args
         if not args:
-            await update.message.reply_text("💡 使用格式：<code>/resetpw &lt;新密码&gt;</code>", parse_mode="HTML")
+            await update.message.reply_text("💡 仅限与 Bot 私聊使用，格式：<code>/resetpw &lt;新密码&gt;</code>", parse_mode="HTML")
             return
         
         new_pw = args[0].strip()
@@ -1168,7 +1173,7 @@ class LemonEmbyBot:
         elif data == "cb_my":
             u = await self.db.get_user_by_tg(user_id)
             if not u:
-                await query.edit_message_text("❌ 尚未绑定 Emby 账号！请使用 /bind 账号 密码 绑定。", reply_markup=self._get_main_keyboard(is_admin))
+                await query.edit_message_text("❌ 尚未绑定 Emby 账号！请先在与 Bot 的私聊中使用 /bind 账号 密码 绑定。", reply_markup=self._get_main_keyboard(is_admin))
                 return
             expiry = self.db.as_utc(u["expiry_date"])
             now = datetime.datetime.now(datetime.timezone.utc)
@@ -1272,7 +1277,7 @@ class LemonEmbyBot:
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
 
         elif data == "cb_redeem_info":
-            text = "🎟️ <b>卡密兑换指引</b>\n\n请直接回复：<code>/redeem LEMON-XXXX-XXXX</code>"
+            text = "🎟️ <b>卡密兑换指引</b>\n\n请先打开与 Bot 的私聊，再发送：<code>/redeem LEMON-XXXX-XXXX</code>"
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
 
         elif data == "cb_lines":
