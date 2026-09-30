@@ -2,7 +2,7 @@ const { createApp, ref, onMounted } = Vue
     createApp({
       render: window.LemonAdminRender,
       setup() {
-        const token = ref(sessionStorage.getItem('lemon_token') || '')
+        const token = ref('')
         const stats = ref({})
         const users = ref([])
         const genForm = ref({ value: 30, count: 5, card_type: 'days' })
@@ -14,7 +14,6 @@ const { createApp, ref, onMounted } = Vue
         })
 
         const fetchData = async () => {
-          sessionStorage.setItem('lemon_token', token.value)
           try {
             const resStats = await fetch('/api/stats', { headers: getHeaders() })
             if (resStats.ok) stats.value = await resStats.json()
