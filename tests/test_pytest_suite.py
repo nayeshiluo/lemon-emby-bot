@@ -232,6 +232,45 @@ async def test_scheduler_does_not_claim_failed_session_was_stopped():
 
     assert notifications == []
 
+
+@pytest.mark.asyncio
+async def test_scheduler_handles_legacy_naive_expiry_timestamp(test_db):
+    import aiosqlite
+
+    await test_db.create_user_record(
+        9010, "emby_legacy_expiry", "legacy_expiry_user", days=30
+    )
+    legacy_expiry = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    ).replace(tzinfo=None).isoformat()
+    async with aiosqlite.connect(test_db.db_path) as conn:
+        await conn.execute(
+            "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
+            (legacy_expiry, 9010),
+        )
+        await conn.commit()
+
+    class FakeEmby:
+        def __init__(self):
+            self.calls = []
+
+        async def set_user_disabled(self, emby_user_id, disabled):
+            self.calls.append((emby_user_id, disabled))
+            return True
+
+    emby = FakeEmby()
+    scheduler = BackgroundScheduler(
+        test_db, emby, {"rules": {"auto_disable_expired": True}}
+    )
+
+    await scheduler.check_expirations()
+
+    user = await test_db.get_user_by_tg(9010)
+    assert user["is_disabled"] == 1
+    assert user["disabled_reason"] == "expired"
+    assert emby.calls == [("emby_legacy_expiry", True)]
+
+
 @pytest.mark.asyncio
 async def test_password_commands_are_restricted_to_private_chats():
     class FakeMessage:
