@@ -1,37 +1,59 @@
+import logging
+import os
+import secrets
+import time
+from collections import OrderedDict
+from threading import Lock
+from typing import Optional
+
 from fastapi import FastAPI, HTTPException, Header, Depends, Request
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import FileResponse
 from pydantic import BaseModel, Field
-import os
-import secrets
-import time
-import logging
-from typing import Optional, Dict
 
 logger = logging.getLogger("lemon-emby.web")
 
-# In-memory failed auth tracking: {ip: [fail_timestamps]}
-FAILED_ATTEMPTS: Dict[str, list] = {}
+# Bounded per-process LRU cache for failed auth attempts.
+FAILED_ATTEMPTS: OrderedDict[str, list[float]] = OrderedDict()
 MAX_FAILS = 5
 LOCKOUT_SECONDS = 300
+MAX_TRACKED_IPS = 10_000
+_FAILED_ATTEMPTS_LOCK = Lock()
 
 def check_ip_rate_limit(client_ip: str):
-    now = time.time()
-    fails = FAILED_ATTEMPTS.get(client_ip, [])
-    # Filter only recent fails within window
-    recent_fails = [t for t in fails if now - t < LOCKOUT_SECONDS]
-    FAILED_ATTEMPTS[client_ip] = recent_fails
-    if len(recent_fails) >= MAX_FAILS:
-        raise HTTPException(
-            status_code=429,
-            detail="Too many failed authentication attempts. Locked out for 5 minutes."
-        )
+    now = time.monotonic()
+    with _FAILED_ATTEMPTS_LOCK:
+        fails = FAILED_ATTEMPTS.get(client_ip)
+        if fails is None:
+            return
+
+        recent_fails = [attempt for attempt in fails if now - attempt < LOCKOUT_SECONDS]
+        if not recent_fails:
+            FAILED_ATTEMPTS.pop(client_ip, None)
+            return
+
+        FAILED_ATTEMPTS[client_ip] = recent_fails
+        FAILED_ATTEMPTS.move_to_end(client_ip)
+        if len(recent_fails) >= MAX_FAILS:
+            raise HTTPException(
+                status_code=429,
+                detail="Too many failed authentication attempts. Locked out for 5 minutes."
+            )
 
 def record_failed_attempt(client_ip: str):
-    now = time.time()
-    fails = FAILED_ATTEMPTS.get(client_ip, [])
-    fails.append(now)
-    FAILED_ATTEMPTS[client_ip] = fails
+    now = time.monotonic()
+    with _FAILED_ATTEMPTS_LOCK:
+        fails = FAILED_ATTEMPTS.get(client_ip, [])
+        recent_fails = [attempt for attempt in fails if now - attempt < LOCKOUT_SECONDS]
+        recent_fails.append(now)
+        if len(recent_fails) > MAX_FAILS:
+            recent_fails = recent_fails[-MAX_FAILS:]
+
+        if client_ip not in FAILED_ATTEMPTS and len(FAILED_ATTEMPTS) >= MAX_TRACKED_IPS:
+            FAILED_ATTEMPTS.popitem(last=False)
+
+        FAILED_ATTEMPTS[client_ip] = recent_fails
+        FAILED_ATTEMPTS.move_to_end(client_ip)
 
 def create_app(config: dict, db, emby_client):
     app = FastAPI(title="Lemon Emby Admin API", version="1.1.0", docs_url=None, redoc_url=None)
@@ -42,6 +64,26 @@ def create_app(config: dict, db, emby_client):
             "Refusing to start admin API with an empty/default server.secret_key; "
             "set a strong unique secret in config.yaml"
         )
+
+    @app.middleware("http")
+    async def add_security_headers(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["Content-Security-Policy"] = (
+            "default-src 'self'; "
+            "script-src 'self'; "
+            "style-src 'self'; "
+            "font-src 'self'; "
+            "img-src 'self' data:; "
+            "connect-src 'self'; "
+            "object-src 'none'; "
+            "base-uri 'self'; "
+            "frame-ancestors 'none'; "
+            "form-action 'self'"
+        )
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["Referrer-Policy"] = "no-referrer"
+        return response
 
     async def verify_auth(request: Request, x_admin_token: Optional[str] = Header(None)):
         client_ip = request.client.host if request.client else "unknown"

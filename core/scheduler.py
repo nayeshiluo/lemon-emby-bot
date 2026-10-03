@@ -5,6 +5,8 @@ from typing import Optional, Callable
 
 logger = logging.getLogger("lemon-emby.scheduler")
 
+NOTIFICATION_TIMEOUT_SECONDS = 10
+
 class BackgroundScheduler:
     """Periodic task scheduler for Emby expiration and concurrency control"""
     def __init__(self, db, emby_client, config: dict, notify_func: Optional[Callable] = None):
@@ -40,48 +42,182 @@ class BackgroundScheduler:
             await asyncio.sleep(interval)
 
     async def check_expirations(self):
-        """Check expired accounts and impending expiry warnings"""
+        """Disable expired users and retry expiry-only reactivations."""
         users = await self.db.get_all_users()
-        now = datetime.datetime.now(datetime.timezone.utc)
-        warn_days = self.config.get("rules", {}).get("warn_days_before_expiry", 3)
-        auto_disable = self.config.get("rules", {}).get("auto_disable_expired", True)
+        rules = self.config.get("rules", {})
+        warn_days = rules.get("warn_days_before_expiry", 3)
+        auto_disable = rules.get("auto_disable_expired", True)
 
-        for u in users:
-            expiry_str = u.get("expiry_date")
-            if not expiry_str:
+        for listed_user in users:
+            tg_id = listed_user.get("tg_id")
+            if tg_id is None:
                 continue
-            
-            expiry = datetime.datetime.fromisoformat(expiry_str)
-            tg_id = u["tg_id"]
-            emby_user_id = u["emby_user_id"]
-            is_disabled = u.get("is_disabled", 0)
 
-            # Check if expired
-            if expiry < now:
-                if not is_disabled and auto_disable:
-                    logger.warning(f"User {u['emby_username']} (TG: {tg_id}) expired. Disabling on Emby...")
-                    disabled = bool(emby_user_id) and await self.emby.set_user_disabled(emby_user_id, True)
-                    if not disabled:
-                        logger.error("Failed to disable expired Emby user %s (TG: %s); retaining retryable local state", emby_user_id, tg_id)
-                        await self.db.log_action(tg_id, "AUTO_EXPIRE_FAILED", "Emby disable request failed")
+            notification = None
+            async with self.db.account_lock(tg_id):
+                # The list may be stale by the time we reach this account. Reload
+                # after acquiring the same lock used by renewal and admin actions.
+                user = await self.db.get_user_by_tg(tg_id)
+                if not user:
+                    continue
+
+                expiry_str = user.get("expiry_date")
+                expiry = self.db.as_utc(expiry_str)
+                if not expiry:
+                    continue
+
+                now = datetime.datetime.now(datetime.timezone.utc)
+                emby_user_id = user.get("emby_user_id")
+                is_disabled = bool(user.get("is_disabled", 0))
+
+                if expiry < now:
+                    if is_disabled or not auto_disable:
                         continue
-                    await self.db.update_user_status(tg_id, True)
-                    await self.db.log_action(tg_id, "AUTO_EXPIRE", f"Account disabled at {expiry_str}")
-                    
-                    if self.notify_func:
-                        msg = (
-                            f"🚨 <b>Emby 账号已到期提醒</b>\n\n"
-                            f"尊敬的 <b>{u['emby_username']}</b>：\n"
-                            f"您的 Emby 账号已于 <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code> 到期并被自动冻结。\n"
-                            f"💡 <i>您可以签到或使用兑换码自助续费激活！</i>"
+
+                    logger.warning(
+                        "User %s (TG: %s) expired. Disabling on Emby...",
+                        user.get("emby_username"),
+                        tg_id,
+                    )
+                    try:
+                        disabled = bool(emby_user_id) and await self.emby.set_user_disabled(
+                            emby_user_id, True
                         )
-                        await self.notify_func(tg_id, msg)
+                    except Exception:
+                        logger.exception(
+                            "Failed to disable expired Emby user %s (TG: %s)",
+                            emby_user_id,
+                            tg_id,
+                        )
+                        disabled = False
+
+                    if not disabled:
+                        logger.error(
+                            "Failed to disable expired Emby user %s (TG: %s); retaining retryable local state",
+                            emby_user_id,
+                            tg_id,
+                        )
+                        await self.db.log_action(
+                            tg_id, "AUTO_EXPIRE_FAILED", "Emby disable request failed"
+                        )
+                        continue
+
+                    await self.db.update_user_status(tg_id, True, reason="expired")
+                    await self.db.log_action(
+                        tg_id, "AUTO_EXPIRE", f"Account disabled at {expiry_str}"
+                    )
+                    notification = ("expired", user.get("emby_username", ""), expiry, expiry_str)
+                else:
+                    # A previous renewal may have extended the account while Emby
+                    # was unavailable. Retry only expiry-caused disables; never
+                    # clear an admin or unknown disable automatically.
+                    if (
+                        is_disabled
+                        and user.get("disabled_reason") == "expired"
+                        and emby_user_id
+                    ):
+                        try:
+                            enabled = await self.emby.set_user_disabled(
+                                emby_user_id, False
+                            )
+                        except Exception:
+                            logger.exception(
+                                "Failed to retry Emby reactivation for user %s (TG: %s)",
+                                emby_user_id,
+                                tg_id,
+                            )
+                            enabled = False
+
+                        if enabled:
+                            await self.db.update_user_status(tg_id, False)
+                            await self.db.log_action(
+                                tg_id, "AUTO_REACTIVATE", "Renewed account re-enabled"
+                            )
+                        else:
+                            logger.error(
+                                "Failed to retry Emby reactivation for user %s (TG: %s)",
+                                emby_user_id,
+                                tg_id,
+                            )
+                            await self.db.log_action(
+                                tg_id,
+                                "AUTO_REACTIVATE_FAILED",
+                                "Emby enable request failed; will retry",
+                            )
+
+                    delta = expiry - now
+                    if (
+                        self.notify_func
+                        and warn_days > 0
+                        and 0 < delta.total_seconds() <= warn_days * 86400
+                    ):
+                        notification = (
+                            "warning",
+                            user.get("emby_username", ""),
+                            expiry,
+                            expiry_str,
+                        )
+
+            if notification and self.notify_func:
+                await self._send_expiry_notification(tg_id, notification, warn_days)
+
+    async def _send_expiry_notification(self, tg_id, notification, warn_days):
+        """Validate and deliver under the same lock used by account mutations."""
+        kind, _, _, expiry_str = notification
+        async with self.db.account_lock(tg_id):
+            user = await self.db.get_user_by_tg(tg_id)
+            if not user or user.get("expiry_date") != expiry_str:
+                return
+            expiry = self.db.as_utc(expiry_str)
+            if not expiry:
+                return
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if kind == "expired":
+                if (
+                    expiry >= now
+                    or not user.get("is_disabled")
+                    or user.get("disabled_reason") != "expired"
+                ):
+                    return
             else:
-                # Check impending expiry warning (e.g., between 0 and warn_days)
-                delta = expiry - now
-                if 0 < delta.total_seconds() <= warn_days * 86400:
-                    # Notify only once or check flag (simple notice)
-                    pass
+                delta = (expiry - now).total_seconds()
+                if not (0 < delta <= warn_days * 86400):
+                    return
+                if user.get("expiry_warning_for") == expiry_str:
+                    return
+
+            username = user.get("emby_username", "")
+            delivered = False
+            try:
+                # Include the database claim in cancellation cleanup as well.
+                if kind == "warning" and not await self.db.claim_expiry_warning(tg_id, expiry_str):
+                    return
+                if kind == "expired":
+                    msg = (
+                        f"🚨 <b>Emby 账号已到期提醒</b>\n\n"
+                        f"尊敬的 <b>{username}</b>：\n"
+                        f"您的 Emby 账号已于 <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code> 到期并被自动冻结。\n"
+                        f"💡 <i>您可以签到或使用兑换码自助续费激活！</i>"
+                    )
+                else:
+                    msg = (
+                        f"⏰ <b>Emby 账号即将到期</b>\n\n"
+                        f"尊敬的 <b>{username}</b>：\n"
+                        f"您的账号预计于 <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code> 到期。\n"
+                        f"💡 <i>您可以签到或使用兑换码自助续费。</i>"
+                    )
+                # Keep the lock until delivery completes or is cancelled, so a
+                # renewal cannot complete while an old reminder is in flight.
+                delivered = await asyncio.wait_for(
+                    self.notify_func(tg_id, msg),
+                    timeout=NOTIFICATION_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.exception("Failed to send expiry notification for TG: %s", tg_id)
+            finally:
+                # CancelledError also reaches this cleanup before the lock exits.
+                if kind == "warning" and delivered is False:
+                    await self.db.release_expiry_warning(tg_id, expiry_str)
 
     async def check_concurrency(self):
         """Check active playback sessions and enforce device limits"""
@@ -111,7 +247,10 @@ class BackgroundScheduler:
                     item_name = ex_s.get("NowPlayingItem", {}).get("Name", "媒体文件")
                     
                     logger.info(f"Killing excess session {sid} for {device_name} ({client_name})")
-                    await self.emby.stop_session(sid, f"超过最大同时播放限制（限制 {max_devs} 台）")
+                    stopped = await self.emby.stop_session(sid, f"超过最大同时播放限制（限制 {max_devs} 台）")
+                    if not stopped:
+                        logger.error("Failed to stop excess session %s for Emby user %s", sid, emby_user_id)
+                        continue
                     
                     if user_db and self.notify_func:
                         msg = (
