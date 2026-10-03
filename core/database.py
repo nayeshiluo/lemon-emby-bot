@@ -1,5 +1,7 @@
 import aiosqlite
+import asyncio
 import datetime
+from contextlib import asynccontextmanager
 import secrets
 import random
 import string
@@ -12,6 +14,29 @@ class Database:
     """Async SQLite Database for Lemon Emby Manager with Atomic Transactions & Hardened Security"""
     def __init__(self, db_path: str = "lemon_emby.db"):
         self.db_path = db_path
+        self._account_locks: Dict[int, asyncio.Lock] = {}
+        self._account_lock_users: Dict[int, int] = {}
+
+    @asynccontextmanager
+    async def account_lock(self, tg_id: int):
+        """Serialize per-account Emby and database changes in this process."""
+        key = int(tg_id)
+        lock = self._account_locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._account_locks[key] = lock
+        self._account_lock_users[key] = self._account_lock_users.get(key, 0) + 1
+        try:
+            async with lock:
+                yield
+        finally:
+            users = self._account_lock_users.get(key, 1) - 1
+            if users <= 0:
+                self._account_lock_users.pop(key, None)
+                if self._account_locks.get(key) is lock:
+                    self._account_locks.pop(key, None)
+            else:
+                self._account_lock_users[key] = users
 
     @staticmethod
     def as_utc(value: Optional[str]) -> Optional[datetime.datetime]:
