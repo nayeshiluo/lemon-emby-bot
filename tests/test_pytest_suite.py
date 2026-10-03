@@ -498,9 +498,19 @@ async def test_ban_commands_do_not_update_local_state_when_emby_fails():
 
     bot = object.__new__(LemonEmbyBot)
     bot.admin_ids = [1]
+    from contextlib import asynccontextmanager
+    import asyncio
+
+    @asynccontextmanager
+    async def account_lock(tg_id):
+        async with asyncio.Lock():
+            yield
+
     bot.db = SimpleNamespace(
         get_user_by_emby_id=AsyncMock(return_value={"tg_id": 501}),
+        get_user_by_tg=AsyncMock(return_value={"tg_id": 501, "emby_user_id": "emby501"}),
         update_user_status=AsyncMock(),
+        account_lock=account_lock,
     )
     bot.emby = SimpleNamespace(
         get_user_by_name=AsyncMock(return_value={"Id": "emby501"}),
@@ -827,3 +837,202 @@ def test_web_api_security():
     finally:
         if os.path.exists(TEST_DB_PATH):
             os.remove(TEST_DB_PATH)
+
+
+@pytest.mark.asyncio
+async def test_expiry_scheduler_serializes_with_concurrent_renewal(test_db):
+    import asyncio
+    import aiosqlite
+
+    tg_id = 9011
+    emby_id = "emby_expiry_renewal"
+    await test_db.create_user_record(tg_id, emby_id, "expiry_renewal_user", days=30)
+    expired_at = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    ).isoformat()
+    async with aiosqlite.connect(test_db.db_path) as conn:
+        await conn.execute(
+            "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
+            (expired_at, tg_id),
+        )
+        await conn.commit()
+
+    class FakeEmby:
+        def __init__(self):
+            self.calls = []
+            self.disabled = False
+            self.disable_started = asyncio.Event()
+            self.release_disable = asyncio.Event()
+            self.name_lookup_done = asyncio.Event()
+
+        async def get_user_by_name(self, username):
+            self.name_lookup_done.set()
+            return {"Id": emby_id, "Name": username}
+
+        async def set_user_disabled(self, user_id, disabled):
+            self.calls.append((user_id, disabled))
+            if disabled and not self.disable_started.is_set():
+                self.disable_started.set()
+                await self.release_disable.wait()
+            self.disabled = disabled
+            return True
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    emby = FakeEmby()
+    bot = object.__new__(LemonEmbyBot)
+    bot.db, bot.emby, bot.admin_ids = test_db, emby, [1]
+    lookup_done = asyncio.Event()
+    original_get_user_by_emby_id = test_db.get_user_by_emby_id
+
+    async def watched_user_by_emby_id(user_id):
+        user = await original_get_user_by_emby_id(user_id)
+        lookup_done.set()
+        return user
+
+    test_db.get_user_by_emby_id = watched_user_by_emby_id
+    scheduler = BackgroundScheduler(
+        test_db, emby, {"rules": {"auto_disable_expired": True}}
+    )
+    expiration_task = asyncio.create_task(scheduler.check_expirations())
+    await emby.disable_started.wait()
+
+    message = FakeMessage()
+    renewal_task = asyncio.create_task(
+        bot.cmd_addtime(
+            SimpleNamespace(
+                effective_user=SimpleNamespace(id=1),
+                message=message,
+            ),
+            SimpleNamespace(args=["expiry_renewal_user", "5"]),
+        )
+    )
+    await lookup_done.wait()
+    await asyncio.sleep(0)
+    assert not renewal_task.done()
+
+    emby.release_disable.set()
+    await asyncio.gather(expiration_task, renewal_task)
+
+    user = await test_db.get_user_by_tg(tg_id)
+    assert test_db.as_utc(user["expiry_date"]) > datetime.datetime.now(datetime.timezone.utc)
+    assert user["is_disabled"] == 0
+    assert user["disabled_reason"] is None
+    assert emby.disabled is False
+    assert emby.calls == [(emby_id, True), (emby_id, False)]
+    assert message.replies and "已增加 5 天" in message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_expiry_scheduler_and_admin_ban_preserve_admin_reason(test_db):
+    import asyncio
+    import aiosqlite
+
+    tg_id = 9012
+    emby_id = "emby_expiry_admin"
+    await test_db.create_user_record(tg_id, emby_id, "expiry_admin_user", days=30)
+    expired_at = (
+        datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(days=1)
+    ).isoformat()
+    async with aiosqlite.connect(test_db.db_path) as conn:
+        await conn.execute(
+            "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
+            (expired_at, tg_id),
+        )
+        await conn.commit()
+
+    class FakeEmby:
+        def __init__(self):
+            self.calls = []
+            self.disabled = False
+            self.disable_started = asyncio.Event()
+            self.release_disable = asyncio.Event()
+            self.name_lookup_done = asyncio.Event()
+
+        async def get_user_by_name(self, username):
+            self.name_lookup_done.set()
+            return {"Id": emby_id, "Name": username}
+
+        async def set_user_disabled(self, user_id, disabled):
+            self.calls.append((user_id, disabled))
+            if disabled and not self.disable_started.is_set():
+                self.disable_started.set()
+                await self.release_disable.wait()
+            self.disabled = disabled
+            return True
+
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    emby = FakeEmby()
+    bot = object.__new__(LemonEmbyBot)
+    bot.db, bot.emby, bot.admin_ids = test_db, emby, [1]
+    scheduler = BackgroundScheduler(
+        test_db, emby, {"rules": {"auto_disable_expired": True}}
+    )
+    expiration_task = asyncio.create_task(scheduler.check_expirations())
+    await emby.disable_started.wait()
+
+    message = FakeMessage()
+    ban_task = asyncio.create_task(
+        bot.cmd_ban(
+            SimpleNamespace(
+                effective_user=SimpleNamespace(id=1),
+                message=message,
+            ),
+            SimpleNamespace(args=["expiry_admin_user"]),
+        )
+    )
+    await lookup_done.wait()
+    await asyncio.sleep(0)
+    assert not ban_task.done()
+
+    emby.release_disable.set()
+    await asyncio.gather(expiration_task, ban_task)
+
+    user = await test_db.get_user_by_tg(tg_id)
+    assert user["is_disabled"] == 1
+    assert user["disabled_reason"] == "admin"
+    assert emby.disabled is True
+    assert emby.calls == [(emby_id, True), (emby_id, True)]
+    assert message.replies and "已封禁" in message.replies[0]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_retries_failed_expiry_reactivation(test_db):
+    await test_db.create_user_record(
+        9013, "emby_retry_activation", "retry_activation_user", days=30
+    )
+    await test_db.update_user_status(9013, True, reason="expired")
+
+    class FakeEmby:
+        def __init__(self):
+            self.calls = []
+            self.results = [False, True]
+
+        async def set_user_disabled(self, emby_user_id, disabled):
+            self.calls.append((emby_user_id, disabled))
+            return self.results.pop(0)
+
+    emby = FakeEmby()
+    scheduler = BackgroundScheduler(test_db, emby, {"rules": {}})
+
+    await scheduler.check_expirations()
+    user = await test_db.get_user_by_tg(9013)
+    assert user["is_disabled"] == 1
+    assert user["disabled_reason"] == "expired"
+
+    await scheduler.check_expirations()
+    user = await test_db.get_user_by_tg(9013)
+    assert user["is_disabled"] == 0
+    assert user["disabled_reason"] is None
+    assert emby.calls == [("emby_retry_activation", False)] * 2
