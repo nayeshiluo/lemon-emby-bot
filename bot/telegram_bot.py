@@ -126,12 +126,14 @@ class LemonEmbyBot:
         # Callback queries (Inline buttons)
         self.app.add_handler(CallbackQueryHandler(self.handle_callback))
 
-    async def send_notification(self, tg_id: int, message: str):
-        """Send message directly to user with error handling"""
+    async def send_notification(self, tg_id: int, message: str) -> bool:
+        """Send a direct message and report whether Telegram accepted it."""
         try:
             await self.app.bot.send_message(chat_id=tg_id, text=message, parse_mode="HTML")
+            return True
         except Exception as e:
             logger.error(f"Failed to send TG message to {tg_id}: {e}")
+            return False
 
     def _get_main_keyboard(self, is_admin: bool = False) -> InlineKeyboardMarkup:
         buttons = [
@@ -752,14 +754,7 @@ class LemonEmbyBot:
             f"━━━━━━━━━━━━━━━━━━━━\n"
             f"💡 <i>建议登录后使用 <code>/resetpw</code> 自助修改个人密码。</i>"
         )
-        if self._is_private_chat(update):
-            await update.message.reply_text(reply_card, parse_mode="HTML")
-        else:
-            await update.message.reply_text(
-                "✅ Emby 账号已开通。登录凭据已通过私聊发送，请勿在群内索取或发布密码。",
-                parse_mode="HTML",
-            )
-
+        notification_sent = None
         if target_tg_id and target_tg_id > 0:
             dm_text = (
                 f"🎉 <b>你好！管理员已为你开通 Emby 观影账号！</b>\n\n"
@@ -772,7 +767,30 @@ class LemonEmbyBot:
                 f"2. 输入上方服务器地址、账号和密码即可畅快观影！\n"
                 f"3. 每日在 Bot 发送 <code>/checkin</code> 即可免费领时长与积分~"
             )
-            await self.send_notification(target_tg_id, dm_text)
+            notification_sent = await self.send_notification(target_tg_id, dm_text)
+
+        if self._is_private_chat(update):
+            await update.message.reply_text(reply_card, parse_mode="HTML")
+            if target_tg_id and target_tg_id > 0 and not notification_sent:
+                await update.message.reply_text(
+                    "⚠️ 账号已开通，但目标用户私聊投递失败；上方凭据仅在本私聊中可见。",
+                    parse_mode="HTML",
+                )
+        elif notification_sent:
+            await update.message.reply_text(
+                "✅ Emby 账号已开通。登录凭据已通过私聊发送，请勿在群内索取或发布密码。",
+                parse_mode="HTML",
+            )
+        elif self.config.get("rules", {}).get("allow_self_reset_password", True):
+            await update.message.reply_text(
+                "⚠️ Emby 账号已开通，但 Bot 私聊投递失败。为保护密码，不会在群里发送凭据。请目标用户先向 Bot 私聊发送 /start，再使用 <code>/resetpw &lt;新密码&gt;</code> 自行设置密码。",
+                parse_mode="HTML",
+            )
+        else:
+            await update.message.reply_text(
+                "⚠️ Emby 账号已开通，但 Bot 私聊投递失败。为保护密码，不会在群里发送凭据；请目标用户联系管理员处理。",
+                parse_mode="HTML",
+            )
 
     # --- ADMIN: DELETE USER ---
     async def cmd_deluser(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -810,6 +828,9 @@ class LemonEmbyBot:
     async def cmd_checkin(self, update: Update, context: ContextTypes.DEFAULT_TYPE):
         if not update.effective_user or not update.message: return
         user_id = update.effective_user.id
+        if not self.config.get("telegram", {}).get("enable_checkin", True):
+            await update.message.reply_text("⛔ 每日签到功能当前已关闭。")
+            return
         if self._check_cooldown(user_id, cooldown_seconds=1.0): return
 
         reward_days = self.config.get("telegram", {}).get("checkin_reward_days", 1)
@@ -937,6 +958,9 @@ class LemonEmbyBot:
         if not self._is_private_chat(update):
             await self._delete_sensitive_command(update)
             await update.message.reply_text("🔒 为保护密码安全，请在与 Bot 的私聊中使用 /resetpw。")
+            return
+        if not self.config.get("rules", {}).get("allow_self_reset_password", True):
+            await update.message.reply_text("⛔ 自助修改密码当前已关闭，请联系管理员。")
             return
         args = context.args
         if not args:
@@ -1245,6 +1269,9 @@ class LemonEmbyBot:
             await query.edit_message_text(text, reply_markup=self._get_main_keyboard(is_admin), parse_mode="HTML")
 
         elif data == "cb_checkin":
+            if not self.config.get("telegram", {}).get("enable_checkin", True):
+                await query.edit_message_text("⛔ 每日签到功能当前已关闭。")
+                return
             reward_days = self.config.get("telegram", {}).get("checkin_reward_days", 1)
             points = self.config.get("telegram", {}).get("checkin_points", 10)
             async with self.db.account_lock(user_id):
