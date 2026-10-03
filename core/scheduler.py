@@ -104,7 +104,7 @@ class BackgroundScheduler:
                     await self.db.log_action(
                         tg_id, "AUTO_EXPIRE", f"Account disabled at {expiry_str}"
                     )
-                    notification = (user.get("emby_username", ""), expiry)
+                    notification = ("expired", user.get("emby_username", ""), expiry, expiry_str)
                 else:
                     # A previous renewal may have extended the account while Emby
                     # was unavailable. Retry only expiry-caused disables; never
@@ -144,22 +144,43 @@ class BackgroundScheduler:
                             )
 
                     delta = expiry - now
-                    if 0 < delta.total_seconds() <= warn_days * 86400:
-                        # Expiry warnings are handled separately from state changes.
-                        pass
+                    if (
+                        self.notify_func
+                        and warn_days > 0
+                        and 0 < delta.total_seconds() <= warn_days * 86400
+                        and await self.db.claim_expiry_warning(tg_id, expiry_str)
+                    ):
+                        notification = (
+                            "warning",
+                            user.get("emby_username", ""),
+                            expiry,
+                            expiry_str,
+                        )
 
             if notification and self.notify_func:
-                username, expiry = notification
-                msg = (
-                    f"🚨 <b>Emby 账号已到期提醒</b>\n\n"
-                    f"尊敬的 <b>{username}</b>：\n"
-                    f"您的 Emby 账号已于 <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code> 到期并被自动冻结。\n"
-                    f"💡 <i>您可以签到或使用兑换码自助续费激活！</i>"
-                )
+                kind, username, expiry, expiry_str = notification
+                if kind == "expired":
+                    msg = (
+                        f"🚨 <b>Emby 账号已到期提醒</b>\n\n"
+                        f"尊敬的 <b>{username}</b>：\n"
+                        f"您的 Emby 账号已于 <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code> 到期并被自动冻结。\n"
+                        f"💡 <i>您可以签到或使用兑换码自助续费激活！</i>"
+                    )
+                else:
+                    msg = (
+                        f"⏰ <b>Emby 账号即将到期</b>\n\n"
+                        f"尊敬的 <b>{username}</b>：\n"
+                        f"您的账号预计于 <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code> 到期。\n"
+                        f"💡 <i>您可以签到或使用兑换码自助续费。</i>"
+                    )
                 try:
-                    await self.notify_func(tg_id, msg)
+                    delivered = await self.notify_func(tg_id, msg)
+                    if kind == "warning" and delivered is False:
+                        await self.db.release_expiry_warning(tg_id, expiry_str)
                 except Exception:
                     logger.exception("Failed to send expiry notification for TG: %s", tg_id)
+                    if kind == "warning":
+                        await self.db.release_expiry_warning(tg_id, expiry_str)
 
     async def check_concurrency(self):
         """Check active playback sessions and enforce device limits"""
