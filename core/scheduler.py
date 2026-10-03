@@ -5,6 +5,8 @@ from typing import Optional, Callable
 
 logger = logging.getLogger("lemon-emby.scheduler")
 
+NOTIFICATION_TIMEOUT_SECONDS = 10
+
 class BackgroundScheduler:
     """Periodic task scheduler for Emby expiration and concurrency control"""
     def __init__(self, db, emby_client, config: dict, notify_func: Optional[Callable] = None):
@@ -148,7 +150,6 @@ class BackgroundScheduler:
                         self.notify_func
                         and warn_days > 0
                         and 0 < delta.total_seconds() <= warn_days * 86400
-                        and await self.db.claim_expiry_warning(tg_id, expiry_str)
                     ):
                         notification = (
                             "warning",
@@ -158,7 +159,39 @@ class BackgroundScheduler:
                         )
 
             if notification and self.notify_func:
-                kind, username, expiry, expiry_str = notification
+                await self._send_expiry_notification(tg_id, notification, warn_days)
+
+    async def _send_expiry_notification(self, tg_id, notification, warn_days):
+        """Validate and deliver under the same lock used by account mutations."""
+        kind, _, _, expiry_str = notification
+        async with self.db.account_lock(tg_id):
+            user = await self.db.get_user_by_tg(tg_id)
+            if not user or user.get("expiry_date") != expiry_str:
+                return
+            expiry = self.db.as_utc(expiry_str)
+            if not expiry:
+                return
+            now = datetime.datetime.now(datetime.timezone.utc)
+            if kind == "expired":
+                if (
+                    expiry >= now
+                    or not user.get("is_disabled")
+                    or user.get("disabled_reason") != "expired"
+                ):
+                    return
+            else:
+                delta = (expiry - now).total_seconds()
+                if not (0 < delta <= warn_days * 86400):
+                    return
+                if user.get("expiry_warning_for") == expiry_str:
+                    return
+
+            username = user.get("emby_username", "")
+            delivered = False
+            try:
+                # Include the database claim in cancellation cleanup as well.
+                if kind == "warning" and not await self.db.claim_expiry_warning(tg_id, expiry_str):
+                    return
                 if kind == "expired":
                     msg = (
                         f"🚨 <b>Emby 账号已到期提醒</b>\n\n"
@@ -173,14 +206,18 @@ class BackgroundScheduler:
                         f"您的账号预计于 <code>{expiry.strftime('%Y-%m-%d %H:%M')}</code> 到期。\n"
                         f"💡 <i>您可以签到或使用兑换码自助续费。</i>"
                     )
-                try:
-                    delivered = await self.notify_func(tg_id, msg)
-                    if kind == "warning" and delivered is False:
-                        await self.db.release_expiry_warning(tg_id, expiry_str)
-                except Exception:
-                    logger.exception("Failed to send expiry notification for TG: %s", tg_id)
-                    if kind == "warning":
-                        await self.db.release_expiry_warning(tg_id, expiry_str)
+                # Keep the lock until delivery completes or is cancelled, so a
+                # renewal cannot complete while an old reminder is in flight.
+                delivered = await asyncio.wait_for(
+                    self.notify_func(tg_id, msg),
+                    timeout=NOTIFICATION_TIMEOUT_SECONDS,
+                )
+            except Exception:
+                logger.exception("Failed to send expiry notification for TG: %s", tg_id)
+            finally:
+                # CancelledError also reaches this cleanup before the lock exits.
+                if kind == "warning" and delivered is False:
+                    await self.db.release_expiry_warning(tg_id, expiry_str)
 
     async def check_concurrency(self):
         """Check active playback sessions and enforce device limits"""
