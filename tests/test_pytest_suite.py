@@ -925,7 +925,7 @@ async def test_expiry_scheduler_serializes_with_concurrent_renewal(test_db):
     assert user["disabled_reason"] is None
     assert emby.disabled is False
     assert emby.calls == [(emby_id, True), (emby_id, False)]
-    assert message.replies and "已增加 5 天" in message.replies[0]
+    assert message.replies and "增加 5 天时长" in message.replies[0]
 
 
 @pytest.mark.asyncio
@@ -976,6 +976,15 @@ async def test_expiry_scheduler_and_admin_ban_preserve_admin_reason(test_db):
     emby = FakeEmby()
     bot = object.__new__(LemonEmbyBot)
     bot.db, bot.emby, bot.admin_ids = test_db, emby, [1]
+    lookup_done = asyncio.Event()
+    original_get_user_by_emby_id = test_db.get_user_by_emby_id
+
+    async def watched_user_by_emby_id(user_id):
+        user = await original_get_user_by_emby_id(user_id)
+        lookup_done.set()
+        return user
+
+    test_db.get_user_by_emby_id = watched_user_by_emby_id
     scheduler = BackgroundScheduler(
         test_db, emby, {"rules": {"auto_disable_expired": True}}
     )
