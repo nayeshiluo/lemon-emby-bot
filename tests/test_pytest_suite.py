@@ -1045,3 +1045,160 @@ async def test_scheduler_retries_failed_expiry_reactivation(test_db):
     assert user["is_disabled"] == 0
     assert user["disabled_reason"] is None
     assert emby.calls == [("emby_retry_activation", False)] * 2
+
+
+@pytest.mark.asyncio
+async def test_group_create_reports_failed_private_delivery_without_exposing_password():
+    class FakeMessage:
+        def __init__(self):
+            self.reply_to_message = SimpleNamespace(
+                from_user=SimpleNamespace(id=7001, username="viewer")
+            )
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = [101]
+    bot.config = {
+        "emby": {"public_url": "https://emby.example.com"},
+        "rules": {"allow_self_reset_password": True},
+    }
+    bot.db = SimpleNamespace(
+        get_user_by_username=AsyncMock(return_value=None),
+        get_user_by_tg=AsyncMock(return_value=None),
+        get_user_by_emby_id=AsyncMock(return_value=None),
+        create_user_record=AsyncMock(return_value=True),
+        log_action=AsyncMock(),
+    )
+    bot.emby = SimpleNamespace(
+        get_user_by_name=AsyncMock(return_value=None),
+        create_user=AsyncMock(return_value={"Id": "emby_new_user"}),
+    )
+    bot.app = SimpleNamespace(
+        bot=SimpleNamespace(send_message=AsyncMock(side_effect=RuntimeError("blocked")))
+    )
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=101),
+        effective_chat=SimpleNamespace(type="group"),
+        message=message,
+    )
+
+    await bot.cmd_create(update, SimpleNamespace(args=["30"]))
+
+    password = bot.emby.create_user.await_args.args[1]
+    assert len(message.replies) == 1
+    assert "私聊投递失败" in message.replies[0]
+    assert "凭据已通过私聊发送" not in message.replies[0]
+    assert password not in message.replies[0]
+    bot.app.bot.send_message.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_checkin_feature_switch_blocks_command_and_callback():
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    bot = object.__new__(LemonEmbyBot)
+    bot.admin_ids = []
+    bot.config = {"telegram": {"enable_checkin": False}}
+    bot.user_cooldowns = {}
+    bot.db = SimpleNamespace(user_checkin=AsyncMock())
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=7002),
+        message=message,
+    )
+
+    await bot.cmd_checkin(update, SimpleNamespace())
+    assert message.replies and "已关闭" in message.replies[0]
+    bot.db.user_checkin.assert_not_awaited()
+
+    query = SimpleNamespace(
+        data="cb_checkin",
+        from_user=SimpleNamespace(id=7002),
+        answer=AsyncMock(),
+        edit_message_text=AsyncMock(),
+    )
+    await bot.handle_callback(SimpleNamespace(callback_query=query), SimpleNamespace())
+    query.answer.assert_awaited_once()
+    query.edit_message_text.assert_awaited_once()
+    assert "已关闭" in query.edit_message_text.await_args.args[0]
+    bot.db.user_checkin.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_self_reset_password_switch_blocks_emby_request():
+    class FakeMessage:
+        def __init__(self):
+            self.replies = []
+
+        async def reply_text(self, text, **kwargs):
+            self.replies.append(text)
+
+    bot = object.__new__(LemonEmbyBot)
+    bot.config = {"rules": {"allow_self_reset_password": False}}
+    bot.db = SimpleNamespace(get_user_by_tg=AsyncMock())
+    bot.emby = SimpleNamespace(update_user_password=AsyncMock())
+    message = FakeMessage()
+    update = SimpleNamespace(
+        effective_user=SimpleNamespace(id=7003),
+        effective_chat=SimpleNamespace(type="private"),
+        message=message,
+    )
+
+    await bot.cmd_resetpw(update, SimpleNamespace(args=["new-password"]))
+
+    assert message.replies and "已关闭" in message.replies[0]
+    bot.db.get_user_by_tg.assert_not_awaited()
+    bot.emby.update_user_password.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_retries_failed_expiry_warning_delivery(test_db):
+    import aiosqlite
+
+    tg_id = 9014
+    await test_db.create_user_record(
+        tg_id, "emby_warning_retry", "warning_retry_user", days=30
+    )
+    expiry = (
+        datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)
+    ).isoformat()
+    async with aiosqlite.connect(test_db.db_path) as conn:
+        await conn.execute(
+            "UPDATE users SET expiry_date = ? WHERE tg_id = ?",
+            (expiry, tg_id),
+        )
+        await conn.commit()
+
+    notifications = []
+
+    async def notify(user_id, message):
+        notifications.append((user_id, message))
+        return len(notifications) > 1
+
+    scheduler = BackgroundScheduler(
+        test_db,
+        SimpleNamespace(set_user_disabled=AsyncMock()),
+        {"rules": {"warn_days_before_expiry": 3}},
+        notify_func=notify,
+    )
+
+    await scheduler.check_expirations()
+    user = await test_db.get_user_by_tg(tg_id)
+    assert user["expiry_warning_for"] is None
+
+    await scheduler.check_expirations()
+    user = await test_db.get_user_by_tg(tg_id)
+    assert user["expiry_warning_for"] == expiry
+
+    await scheduler.check_expirations()
+    assert len(notifications) == 2
+    assert all("即将到期" in message for _, message in notifications)
