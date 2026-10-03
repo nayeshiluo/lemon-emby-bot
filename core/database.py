@@ -62,6 +62,7 @@ class Database:
                 max_devices INTEGER DEFAULT 2,
                 is_disabled INTEGER DEFAULT 0,
                 disabled_reason TEXT,
+                expiry_warning_for TEXT,
                 last_checkin TEXT,
                 created_at TEXT
             );
@@ -72,6 +73,8 @@ class Database:
                 # Existing disabled users remain unknown until an admin reviews them;
                 # never infer that a prior manual ban was only an expiry suspension.
                 await db.execute("ALTER TABLE users ADD COLUMN disabled_reason TEXT")
+            if "expiry_warning_for" not in user_columns:
+                await db.execute("ALTER TABLE users ADD COLUMN expiry_warning_for TEXT")
             await db.execute("""
             CREATE TABLE IF NOT EXISTS codes (
                 code TEXT PRIMARY KEY,
@@ -194,6 +197,28 @@ class Database:
                     "UPDATE users SET is_disabled = 0, disabled_reason = NULL WHERE tg_id = ?",
                     (tg_id,),
                 )
+            await db.commit()
+
+    async def claim_expiry_warning(self, tg_id: int, expiry_str: str) -> bool:
+        """Claim one reminder for the current expiry timestamp."""
+        async with aiosqlite.connect(self.db_path) as db:
+            cursor = await db.execute(
+                """UPDATE users SET expiry_warning_for = ?
+                   WHERE tg_id = ? AND expiry_date = ?
+                     AND (expiry_warning_for IS NULL OR expiry_warning_for != ?)""",
+                (expiry_str, tg_id, expiry_str, expiry_str),
+            )
+            await db.commit()
+            return cursor.rowcount == 1
+
+    async def release_expiry_warning(self, tg_id: int, expiry_str: str) -> None:
+        """Allow a failed reminder delivery to be retried for the same expiry."""
+        async with aiosqlite.connect(self.db_path) as db:
+            await db.execute(
+                """UPDATE users SET expiry_warning_for = NULL
+                   WHERE tg_id = ? AND expiry_date = ? AND expiry_warning_for = ?""",
+                (tg_id, expiry_str, expiry_str),
+            )
             await db.commit()
 
     async def delete_user_record(self, tg_id: int):
