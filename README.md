@@ -119,3 +119,7 @@
 
 ## 📄 License
 MIT License © 2026 nayeshiluo
+
+## 上线前验收门槛
+
+[2026-10-04 验收记录](docs/ACCEPTANCE_20261004.md)：Emby Key仅通过认证头发送，拒绝重定向，错误日志不记录上游正文或异常原文。新增真实本地HTTP传输回归；线上Emby／Telegram生命周期仍需专用测试配置，不可用模拟测试替代。

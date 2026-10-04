@@ -18,8 +18,10 @@ class EmbyClient:
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> Any:
         url = f"{self.server_url}{endpoint}"
-        params = kwargs.pop("params", {}) or {}
-        params["api_key"] = self.api_key
+        params = dict(kwargs.pop("params", {}) or {})
+        params.pop("api_key", None)
+        # Authentication stays in the header; redirects must not forward it.
+        kwargs["allow_redirects"] = False
         
         async with aiohttp.ClientSession() as session:
             try:
@@ -29,11 +31,10 @@ class EmbyClient:
                             return await resp.json()
                         return await resp.text()
                     else:
-                        error_text = await resp.text()
-                        logger.error(f"Emby API Error [{resp.status}] on {method} {endpoint}: {error_text}")
+                        logger.error("Emby API request failed: HTTP %s (%s)", resp.status, method)
                         return None
             except Exception as e:
-                logger.error(f"Emby connection error: {e}")
+                logger.error("Emby connection error: %s", type(e).__name__)
                 return None
 
     async def get_system_info(self) -> Optional[Dict[str, Any]]:
