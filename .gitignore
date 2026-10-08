@@ -11,3 +11,5 @@ lemon_emby.db
 *.bak
 backups/
 runtime/
+/node_modules/
+npm-debug.log*

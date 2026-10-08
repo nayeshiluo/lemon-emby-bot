@@ -18,8 +18,10 @@ class EmbyClient:
 
     async def _request(self, method: str, endpoint: str, **kwargs) -> Any:
         url = f"{self.server_url}{endpoint}"
-        params = kwargs.pop("params", {}) or {}
-        params["api_key"] = self.api_key
+        params = dict(kwargs.pop("params", {}) or {})
+        params.pop("api_key", None)
+        # Authentication stays in the header; redirects must not forward it.
+        kwargs["allow_redirects"] = False
         
         async with aiohttp.ClientSession() as session:
             try:
@@ -29,11 +31,10 @@ class EmbyClient:
                             return await resp.json()
                         return await resp.text()
                     else:
-                        error_text = await resp.text()
-                        logger.error(f"Emby API Error [{resp.status}] on {method} {endpoint}: {error_text}")
+                        logger.error("Emby API request failed: HTTP %s (%s)", resp.status, method)
                         return None
             except Exception as e:
-                logger.error(f"Emby connection error: {e}")
+                logger.error("Emby connection error: %s", type(e).__name__)
                 return None
 
     async def get_system_info(self) -> Optional[Dict[str, Any]]:
@@ -58,27 +59,41 @@ class EmbyClient:
         return await self._request("GET", f"/Users/{user_id}")
 
     async def create_user(self, name: str, password: Optional[str] = None) -> Optional[Dict[str, Any]]:
-        """Create a new user and optionally clone policy from template user"""
+        """Create a user only after its password and configured policy are applied."""
         res = await self._request("POST", "/Users/New", json={"Name": name})
         if not res or not isinstance(res, dict):
             return None
-        
+
         user_id = res.get("Id")
         if not user_id:
             return None
-        
-        # Set password if provided
-        if password:
-            await self.update_user_password(user_id, password)
 
-        # Clone policy and access from template user if configured
+        async def abort_creation(reason: str) -> None:
+            try:
+                deleted = await self.delete_user(user_id)
+            except Exception:
+                logger.exception("Failed to clean up incomplete Emby user %s", user_id)
+                return
+            if not deleted:
+                logger.error("Could not clean up incomplete Emby user %s after %s", user_id, reason)
+
+        if password is not None and not await self.update_user_password(user_id, password):
+            await abort_creation("password update failure")
+            return None
+
         if self.template_user_id:
             template_user = await self.get_user(self.template_user_id)
-            if template_user and "Policy" in template_user:
-                policy = template_user["Policy"]
-                # Ensure new user is not admin even if template is
-                policy["IsAdministrator"] = False
-                await self._request("POST", f"/Users/{user_id}/Policy", json=policy)
+            policy = template_user.get("Policy") if isinstance(template_user, dict) else None
+            if not isinstance(policy, dict):
+                await abort_creation("template policy lookup failure")
+                return None
+
+            policy = dict(policy)
+            policy["IsAdministrator"] = False
+            policy_result = await self._request("POST", f"/Users/{user_id}/Policy", json=policy)
+            if policy_result is None:
+                await abort_creation("template policy update failure")
+                return None
 
         return res
 
@@ -121,5 +136,5 @@ class EmbyClient:
             "TimeoutMs": 3000
         })
         # Command to stop playback
-        await self._request("POST", f"/Sessions/{session_id}/Playing/Stop")
-        return True
+        stop_result = await self._request("POST", f"/Sessions/{session_id}/Playing/Stop")
+        return stop_result is not None
